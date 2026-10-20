@@ -283,7 +283,7 @@ To clear the description:
 			Default: false,
 		}, {
 			Name:    "list_mode",
-			Help:    "Format to list files (e.g., flat, albums, calendar, description_path).",
+			Help:    "Format to list files (e.g., flat, calendar, description_path).",
 			Default: "flat",
 		}, {
 			Name:     "apk_version",
@@ -445,8 +445,6 @@ func (f *Fs) getVirtualPaths(item *api.MediaItem, fileName string) []string {
 		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), fileName))
 	case "calendar", "calender", "day", "week":
 		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%04d-%02d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), tm.Year(), tm.Month(), tm.Day(), fileName))
-	case "albums":
-		itemPaths = append(itemPaths, fileName)
 	case "description_path", "description":
 		pathsStr := ""
 		idx := strings.Index(item.Caption, "{paths:[")
@@ -590,10 +588,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, fmt.Errorf("cache list failed: %w", err)
 	}
 
+	isFlatMode := strings.ToLower(f.opt.ListMode) == "flat" || f.opt.ListMode == ""
+
 	nameCount := make(map[string]int)
-	for _, item := range items {
-		if item.FileName != "" {
-			nameCount[item.FileName]++
+	if isFlatMode {
+		for _, item := range items {
+			if item.FileName != "" {
+				nameCount[item.FileName]++
+			}
 		}
 	}
 
@@ -605,7 +607,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 
 		fileName := item.FileName
-		if nameCount[fileName] > 1 {
+		if isFlatMode && nameCount[fileName] > 1 {
 			ext := path.Ext(fileName)
 			base := fileName[:len(fileName)-len(ext)]
 			suffix := item.DedupKey
