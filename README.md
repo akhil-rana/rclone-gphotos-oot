@@ -138,3 +138,8 @@ This project builds upon the foundational work of the open-source community:
 - **[@xob0t](https://github.com/xob0t):** Author of the original [rclone/rclone#9135](https://github.com/rclone/rclone/pull/9135) pull request. A significant portion of the core Mobile API reverse-engineering and backend logic was adapted from his fork branch [`xob0t:backend/gphotosmobile`](https://github.com/xob0t/rclone/tree/backend/gphotosmobile).
 - **[gotohp](https://github.com/xob0t/gotohp):** Also created by `@xob0t`, serving as an invaluable reference for reverse-engineering Google Photos internal Protobuf schemas and mobile upload pipelines.
 - **[rclone_out_of_tree_example](https://github.com/rclone/rclone_out_of_tree_example):** Provided the foundational architectural template and build scaffolding for structuring an independent out-of-tree remote backend.
+
+---
+
+> [!NOTE]
+> **Development Disclaimer:** This project is **AI-assisted, not "vibe coded"**. While the implementation has been heavily and professionally reviewed, it has **not** been professionally or exhaustively tested. Because the code was written with AI and interacts with undocumented APIs, please use it with caution.
