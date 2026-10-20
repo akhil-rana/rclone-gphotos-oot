@@ -22,8 +22,6 @@ import (
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/user/rclone-gphotos-oot/backend/gphotosmobile/api"
-
-	_ "embed"
 )
 
 var (
@@ -145,9 +143,6 @@ var systemMetadataInfo = map[string]fs.MetadataHelp{
 		ReadOnly: true,
 	},
 }
-
-//go:embed gphotosmobile.md
-var gphotosmobileMD string
 
 func init() {
 	fs.Register(&fs.RegInfo{
