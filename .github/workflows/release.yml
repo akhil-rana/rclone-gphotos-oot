@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (leave blank to auto-detect from go.mod)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Rclone Version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          else
+            VER=$(grep -E '^\s*github.com/rclone/rclone\s+' go.mod | awk '{print $2}')
+          fi
+
+          if [ -z "$VER" ]; then
+            echo "Error: Could not determine version from go.mod"
+            exit 1
+          fi
+
+          echo "version=${VER}" >> $GITHUB_OUTPUT
+          echo "Target Release Version: ${VER}"
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive_format: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive_format: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive_format: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive_format: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive_format: zip
+          - goos: windows
+            goarch: arm64
+            archive_format: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build & Package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p bin release_assets
+          bin_name="rclone"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            bin_name="rclone.exe"
+          fi
+
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -v -trimpath -ldflags="-s -w" -o "bin/${bin_name}" rclone.go
+
+          archive_base="rclone-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+
+          if [ "${{ matrix.archive_format }}" = "zip" ]; then
+            (cd bin && zip "../release_assets/${archive_base}.zip" "${bin_name}")
+          else
+            tar -czvf "release_assets/${archive_base}.tar.gz" -C bin "${bin_name}"
+          fi
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release_assets/*
+
+  release:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          pattern: assets-*
+          merge-multiple: true
+
+      - name: Generate Checksums
+        run: |
+          cd release_assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: "Rclone Google Photos Mobile ${{ needs.prepare.outputs.version }}"
+          draft: false
+          prerelease: false
+          files: |
+            release_assets/*
+          generate_release_notes: true
