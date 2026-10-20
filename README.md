@@ -27,9 +27,8 @@ This out-of-tree Rclone plugin emulates the official Google Photos Android app v
 - **Virtual Listing Modes:** Support for different library layouts, including flat, hierarchical calendar date trees, or virtual directory structures. See [Listing Modes](#listing-modes) for more details.
 - **Automated In-Memory Browser Login (Linux Desktop):** Fast, zero-hassle authentication. Launches Chromium, Chrome, or Brave in debug mode and captures session tokens directly from browser memory via Chrome DevTools Protocol (CDP).
 - **Manual Authentication Option:** Simple manual token entry (`oauth_token`) for headless servers, macOS, Windows, or alternative environments.
-- **Unlimited Original Quality Uploads (Pixel Spoofing):**
-  > [!WARNING]
-  > **Extreme Caution:** This feature emulates a Google Pixel 1 XL (Android 28) device during upload commits, allowing original quality uploads without consuming your Google One storage quota. **Use this entirely at your own risk.** We are not responsible if Google restricts or bans your account for spoofing device signatures.
+- **Unlimited Original Quality Uploads (Pixel Spoofing):** Emulates a Google Pixel 1 XL device during upload, allowing original quality uploads without consuming your Google storage quota.
+  > **Use at your own risk:** Spoofing device signatures violates Google's Terms of Service. We are not responsible if Google restricts or bans your account for spoofing hardware identifiers.
 
 ---
 
