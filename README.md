@@ -33,6 +33,14 @@ This out-of-tree Rclone plugin emulates the official Google Photos Android app v
 
 ---
 
+## Why Not Part of the Native Rclone Repository?
+
+Because this backend relies on reverse-engineered internal Google Photos mobile endpoints, Protobuf protocols, and device impersonation, it cannot be merged into mainline Rclone.
+
+An upstream pull request was proposed in [rclone/rclone#9135](https://github.com/rclone/rclone/pull/9135), where **Nick Craig-Wood ([@ncw](https://github.com/ncw))**, the lead maintainer of Rclone, [formally declined](https://github.com/rclone/rclone/pull/9135#issuecomment-4449581121) merging it into core Rclone due to significant project and legal risks. An out-of-tree backend was recommended in that discussion, hence this implementation.
+
+---
+
 ## Setup & Configuration
 
 ### 1. Build the Binary
@@ -120,3 +128,13 @@ rclone sync /home/user/Pictures gphotos:pictures --progress
 # Download a folder preserving full, bit-for-bit original quality
 rclone copy gphotos:pictures /home/user/RestoredPhotos --progress
 ```
+
+---
+
+## Acknowledgements & References
+
+This project builds upon the foundational work of the open-source community:
+
+- **[@xob0t](https://github.com/xob0t):** Author of the original [rclone/rclone#9135](https://github.com/rclone/rclone/pull/9135) pull request. A significant portion of the core Mobile API reverse-engineering and backend logic was adapted from his fork branch [`xob0t:backend/gphotosmobile`](https://github.com/xob0t/rclone/tree/backend/gphotosmobile).
+- **[gotohp](https://github.com/xob0t/gotohp):** Also created by `@xob0t`, serving as an invaluable reference for reverse-engineering Google Photos internal Protobuf schemas and mobile upload pipelines.
+- **[rclone_out_of_tree_example](https://github.com/rclone/rclone_out_of_tree_example):** Provided the foundational architectural template and build scaffolding for structuring an independent out-of-tree remote backend.
