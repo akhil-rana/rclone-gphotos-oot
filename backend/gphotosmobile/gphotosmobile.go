@@ -599,16 +599,25 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, fmt.Errorf("cache list failed: %w", err)
 	}
 
-	isFlatMode := strings.ToLower(f.opt.ListMode) == "flat" || f.opt.ListMode == ""
-
-	nameCount := make(map[string]int)
-	if isFlatMode {
-		for _, item := range items {
-			if item.FileName != "" {
-				nameCount[item.FileName]++
-			}
+	// Deduplicate items by dedup_key so album references / shadow entries don't duplicate files
+	seenDedup := make(map[string]int)
+	var dedupedItems []api.MediaItem
+	for _, item := range items {
+		dKey := item.DedupKey
+		if dKey == "" {
+			dKey = item.MediaKey
 		}
+		if idx, seen := seenDedup[dKey]; seen {
+			// If already seen, prefer the canonical item
+			if item.IsCanonical && !dedupedItems[idx].IsCanonical {
+				dedupedItems[idx] = item
+			}
+			continue
+		}
+		seenDedup[dKey] = len(dedupedItems)
+		dedupedItems = append(dedupedItems, item)
 	}
+	items = dedupedItems
 
 	dirs := make(map[string]bool)
 
@@ -617,17 +626,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			continue
 		}
 
-		fileName := item.FileName
-		if isFlatMode && nameCount[fileName] > 1 {
-			ext := path.Ext(fileName)
-			base := fileName[:len(fileName)-len(ext)]
-			suffix := item.DedupKey
-			if suffix == "" {
-				suffix = item.MediaKey
-			}
-			fileName = fmt.Sprintf("%s_%s%s", base, suffix, ext)
-		}
-		fileName = f.opt.Enc.FromStandardName(fileName)
+		fileName := f.opt.Enc.FromStandardName(item.FileName)
 
 		itemPaths := f.getVirtualPaths(&item, fileName)
 
