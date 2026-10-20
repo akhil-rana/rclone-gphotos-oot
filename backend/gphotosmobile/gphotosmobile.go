@@ -176,55 +176,90 @@ To clear the description:
 				"description": "The description text to set (empty to clear)",
 			},
 		}},
-						Config: func(ctx context.Context, name string, m configmap.Mapper, configIn fs.ConfigIn) (*fs.ConfigOut, error) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper, configIn fs.ConfigIn) (*fs.ConfigOut, error) {
+
+			// Helper to exchange and finish
+			exchangeAndSave := func(token string) (*fs.ConfigOut, error) {
+				if !strings.HasPrefix(token, "oauth2_4/") {
+					return nil, fmt.Errorf("Invalid cookie format. The 'oauth_token' should start with 'oauth2_4/'.")
+				}
+				fs.Infof(nil, "Exchanging oauth_token for Android credentials...")
+				newAuthData, err := exchangeOAuthToken(ctx, token)
+				if err != nil {
+					return nil, fmt.Errorf("Failed to exchange oauth_token: %v", err)
+				}
+				m.Set("auth_data", newAuthData)
+
+				// Verification check
+				deviceModel, _ := m.Get("device_model")
+				deviceMake, _ := m.Get("device_make")
+				unlimited, _ := m.Get("unlimited_upload")
+				if unlimited == "true" {
+					deviceModel = "Pixel XL"
+					deviceMake = "Google"
+				}
+				api := NewMobileAPI(ctx, newAuthData, deviceModel, deviceMake, 0, 0)
+				_, err = api.bearerToken(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("Authentication verification failed: %v", err)
+				}
+
+				email := parseEmail(newAuthData)
+				fs.Infof(nil, "Successfully authenticated as %s", email)
+				return nil, nil
+			}
+
 			switch configIn.State {
 			case "":
 				authData, _ := m.Get("auth_data")
 				if authData == "" {
 					return nil, nil
 				}
-				
-				// Handle oauth_token input (Option 1)
-				if !strings.Contains(authData, "androidId=") {
-					fs.Infof(nil, "Exchanging oauth_token for Android credentials...")
-					newAuthData, err := exchangeOAuthToken(ctx, authData)
-					if err != nil {
-						return fs.ConfigError("auth_data", fmt.Sprintf("Failed to exchange oauth_token: %v\nMake sure you pasted the exact 'oauth_token' cookie from https://accounts.google.com/EmbeddedSetup", err))
-					}
-					// Update the config map so it saves the proper androidId string
-					m.Set("auth_data", newAuthData)
-					authData = newAuthData
-				}
 
-				email := parseEmail(authData)
-				if email == "" {
-					fs.Logf(nil, "Warning: could not parse email from auth_data")
+				if strings.Contains(authData, "androidId=") {
+					email := parseEmail(authData)
+					fs.Infof(nil, "Successfully authenticated as %s", email)
 					return nil, nil
 				}
 
-				deviceModel, _ := m.Get("device_model")
-				deviceMake, _ := m.Get("device_make")
-				
-				unlimited, _ := m.Get("unlimited_upload")
-				if unlimited == "true" {
-					deviceModel = "Pixel XL"
-					deviceMake = "Google"
+				if authData == "auto" {
+					fs.Infof(nil, "Starting automated browser login...")
+					token, err := automatedBrowserLogin(ctx)
+					if err != nil {
+						return nil, fmt.Errorf("Auto-login failed: %v", err)
+					}
+					fs.Infof(nil, "Successfully grabbed oauth_token!")
+					return exchangeAndSave(token)
+
+				} else if authData == "manual" {
+					return &fs.ConfigOut{
+						State: "do_manual",
+						Option: &fs.Option{
+							Name:     "oauth_token_prompt",
+							Help:     "=== MANUAL LOGIN ===\n1. Open this link: https://accounts.google.com/EmbeddedSetup\n2. Sign in to your Google Account and click 'I agree'.\n3. The page will eventually show a loading spinner forever. This is normal!\n4. Press F12 to open Developer Tools.\n5. Go to the 'Application' (Chrome) or 'Storage' (Firefox) tab.\n6. Expand 'Cookies' -> 'https://accounts.google.com'.\n7. Find 'oauth_token', copy its Value, and paste it below.",
+							Required: true,
+						},
+					}, nil
 				}
 
-				api := NewMobileAPI(ctx, authData, deviceModel, deviceMake, 0, 0)
-				_, err := api.bearerToken(ctx)
-				if err != nil {
-					return fs.ConfigError("auth_data", fmt.Sprintf("Authentication failed for %s: %v\nCheck that your auth_data is correct and not expired.", email, err))
-				}
-				fs.Infof(nil, "Successfully authenticated as %s", email)
-				return nil, nil // Done — auth works
+				// If they somehow typed a token directly into the first prompt
+				return exchangeAndSave(authData)
+
+			case "do_manual":
+				return exchangeAndSave(configIn.Result)
 			}
 			return nil, fmt.Errorf("unknown config state %q", configIn.State)
 		},
 		Options: []fs.Option{{
-			Name:      "auth_data",
-			Help:      "Google Photos mobile API auth data.\n\nEASIEST METHOD (Option 1):\n1. Open this link in your browser: https://accounts.google.com/EmbeddedSetup\n2. Sign in and click 'I agree' (the page will then keep loading forever, this is normal).\n3. Open your browser's Developer Tools (F12) -> Application or Storage -> Cookies.\n4. Copy the value of the 'oauth_token' cookie and paste it here.\n\nAlternatively, paste a raw Android credential string starting with 'androidId='.",
-
+			Name: "auth_data",
+			Help: "Google Photos mobile API auth data.",
+			Examples: []fs.OptionExample{{
+				Value: "auto",
+				Help:  "Automated Browser Login (Linux Desktop only - requires Chrome/Brave/Chromium)",
+			}, {
+				Value: "manual",
+				Help:  "Manual Login (Paste oauth_token from Developer Tools)",
+			}},
 			Required:  true,
 			Sensitive: true,
 		}, {
@@ -458,8 +493,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, fmt.Errorf("cache sync failed: %w", err)
 	}
 
-
-
 	items, err := f.cache.ListAll()
 	if err != nil {
 		return nil, fmt.Errorf("cache list failed: %w", err)
@@ -478,7 +511,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		if item.FileName == "" {
 			continue
 		}
-		
+
 		fileName := item.FileName
 		if nameCount[fileName] > 1 {
 			ext := path.Ext(fileName)
@@ -493,7 +526,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 		var itemPath string
 		tm := time.UnixMilli(item.UTCTimestamp).UTC()
-		
+
 		switch strings.ToLower(f.opt.ListMode) {
 		case "year":
 			itemPath = fmt.Sprintf("%04d/%s", tm.Year(), fileName)
@@ -559,7 +592,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	if err != nil {
 		return nil, fmt.Errorf("failed to get SHA1 hash: %w", err)
 	}
-	
+
 	sha1Bytes, err := hex.DecodeString(hashStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid SHA1 hash hex: %w", err)
@@ -613,7 +646,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
-return nil
+	return nil
 }
 
 func (f *Fs) Shutdown(ctx context.Context) error {
@@ -626,7 +659,7 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
-return errCantRmdir
+	return errCantRmdir
 }
 
 const syncIntervalSeconds = 30
