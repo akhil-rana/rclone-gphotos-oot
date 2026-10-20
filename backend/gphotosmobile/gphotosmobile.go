@@ -283,7 +283,7 @@ To clear the description:
 			Default: false,
 		}, {
 			Name:    "list_mode",
-			Help:    "Format to list files (e.g., flat, albums, calendar, date).",
+			Help:    "Format to list files (e.g., flat, albums, calendar, description_path).",
 			Default: "flat",
 		}, {
 			Name:     "apk_version",
@@ -434,6 +434,84 @@ func (f *Fs) Precision() time.Duration { return fs.ModTimeNotSupported }
 
 func (f *Fs) Hashes() hash.Set { return hash.Set(hash.SHA1) }
 
+func (f *Fs) getVirtualPaths(item *api.MediaItem, fileName string) []string {
+	var itemPaths []string
+	tm := time.UnixMilli(item.UTCTimestamp).UTC()
+
+	switch strings.ToLower(f.opt.ListMode) {
+	case "year":
+		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%s", tm.Year(), fileName))
+	case "month", "year_month":
+		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), fileName))
+	case "calendar", "calender", "day", "week":
+		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%04d-%02d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), tm.Year(), tm.Month(), tm.Day(), fileName))
+	case "albums":
+		itemPaths = append(itemPaths, fileName)
+	case "description_path", "description":
+		pathsStr := ""
+		idx := strings.Index(item.Caption, "{paths:[")
+		if idx != -1 {
+			endIdx := strings.Index(item.Caption[idx:], "]}")
+			if endIdx != -1 {
+				pathsStr = item.Caption[idx+len("{paths:[") : idx+endIdx]
+			}
+		} else {
+			idx = strings.Index(item.Caption, "[paths:")
+			if idx != -1 {
+				endIdx := strings.Index(item.Caption[idx:], "]")
+				if endIdx != -1 {
+					pathsStr = item.Caption[idx+len("[paths:") : idx+endIdx]
+				}
+			} else {
+				idx = strings.Index(item.Caption, "[path:")
+				if idx != -1 {
+					endIdx := strings.Index(item.Caption[idx:], "]")
+					if endIdx != -1 {
+						pathsStr = item.Caption[idx+len("[path:") : idx+endIdx]
+					}
+				}
+			}
+		}
+
+		if pathsStr != "" {
+			parts := strings.Split(pathsStr, ",")
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				p = strings.TrimPrefix(p, "\"")
+				p = strings.TrimSuffix(p, "\"")
+				p = strings.TrimSpace(p)
+				p = strings.TrimPrefix(p, "/")
+				p = strings.TrimSuffix(p, "/")
+				if p != "" {
+					itemPaths = append(itemPaths, path.Join(p, fileName))
+				} else {
+					itemPaths = append(itemPaths, fileName)
+				}
+			}
+		} else {
+			itemPaths = append(itemPaths, fileName)
+		}
+	default: // "flat"
+		itemPaths = append(itemPaths, fileName)
+	}
+
+	// Apply f.root filtering if necessary, but actually for NewObject we might not need to if `remote` is already relative to f.root.
+	// Wait, `remote` in NewObject is relative to `f.root`.
+	// So we should return paths relative to `f.root`.
+	var relPaths []string
+	for _, p := range itemPaths {
+		if f.root != "" {
+			if !strings.HasPrefix(p, f.root+"/") && p != f.root {
+				continue
+			}
+			p = strings.TrimPrefix(p, f.root+"/")
+		}
+		relPaths = append(relPaths, p)
+	}
+
+	return relPaths
+}
+
 // NewObject finds the Object at remote
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if err := f.ensureCachePopulated(ctx); err != nil {
@@ -452,6 +530,20 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		}
 	} else if err != nil {
 		return nil, fmt.Errorf("cache lookup failed: %w", err)
+	}
+
+	// Verify that the requested remote actually matches one of the item's virtual paths
+	validPaths := f.getVirtualPaths(item, fileName)
+	isValid := false
+	for _, vp := range validPaths {
+		if vp == remote {
+			isValid = true
+			break
+		}
+	}
+
+	if !isValid {
+		return nil, fs.ErrorObjectNotFound
 	}
 
 	return &Object{
@@ -524,56 +616,36 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 		fileName = f.opt.Enc.FromStandardName(fileName)
 
-		var itemPath string
-		tm := time.UnixMilli(item.UTCTimestamp).UTC()
+		itemPaths := f.getVirtualPaths(&item, fileName)
 
-		switch strings.ToLower(f.opt.ListMode) {
-		case "year":
-			itemPath = fmt.Sprintf("%04d/%s", tm.Year(), fileName)
-		case "month", "year_month":
-			itemPath = fmt.Sprintf("%04d/%04d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), fileName)
-		case "calendar", "calender", "day", "week":
-			itemPath = fmt.Sprintf("%04d/%04d-%02d/%04d-%02d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), tm.Year(), tm.Month(), tm.Day(), fileName)
-		case "albums":
-			itemPath = fileName
-		default: // "flat"
-			itemPath = fileName
-		}
+		for _, itemPath := range itemPaths {
 
-		// Rclone provides `dir` relative to `f.root`.
-		// We first evaluate `itemPath` against `f.root`.
-		if f.root != "" {
-			if !strings.HasPrefix(itemPath, f.root+"/") && itemPath != f.root {
-				continue
-			}
-			itemPath = strings.TrimPrefix(itemPath, f.root+"/")
-		}
-
-		// Now itemPath is relative to the current virtual filesystem root.
-		// We check it against the requested `dir`.
-		if dir == "" {
-			if !strings.Contains(itemPath, "/") {
-				o := &Object{fs: f, remote: itemPath, media: item, hasMedia: true}
-				entries = append(entries, o)
-			} else {
-				dirName := strings.Split(itemPath, "/")[0]
-				if !dirs[dirName] {
-					dirs[dirName] = true
-					entries = append(entries, fs.NewDir(dirName, f.startTime))
-				}
-			}
-		} else {
-			if strings.HasPrefix(itemPath, dir+"/") {
-				relPath := strings.TrimPrefix(itemPath, dir+"/")
-				if !strings.Contains(relPath, "/") {
+			// Now itemPath is relative to the current virtual filesystem root.
+			// We check it against the requested `dir`.
+			if dir == "" {
+				if !strings.Contains(itemPath, "/") {
 					o := &Object{fs: f, remote: itemPath, media: item, hasMedia: true}
 					entries = append(entries, o)
 				} else {
-					subDirName := strings.Split(relPath, "/")[0]
-					dirRemote := dir + "/" + subDirName
-					if !dirs[dirRemote] {
-						dirs[dirRemote] = true
-						entries = append(entries, fs.NewDir(dirRemote, f.startTime))
+					dirName := strings.Split(itemPath, "/")[0]
+					if !dirs[dirName] {
+						dirs[dirName] = true
+						entries = append(entries, fs.NewDir(dirName, f.startTime))
+					}
+				}
+			} else {
+				if strings.HasPrefix(itemPath, dir+"/") {
+					relPath := strings.TrimPrefix(itemPath, dir+"/")
+					if !strings.Contains(relPath, "/") {
+						o := &Object{fs: f, remote: itemPath, media: item, hasMedia: true}
+						entries = append(entries, o)
+					} else {
+						subDirName := strings.Split(relPath, "/")[0]
+						dirRemote := dir + "/" + subDirName
+						if !dirs[dirRemote] {
+							dirs[dirRemote] = true
+							entries = append(entries, fs.NewDir(dirRemote, f.startTime))
+						}
 					}
 				}
 			}
@@ -627,13 +699,114 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	f.cacheMu.Unlock()
 	_ = f.ensureCachePopulated(ctx)
 
+	// Generate dedupKey locally from SHA1 to reliably hit the cache
+	s := strings.ReplaceAll(sha1B64, "+", "-")
+	s = strings.ReplaceAll(s, "/", "_")
+	localDedupKey := strings.TrimRight(s, "=")
+
 	media := api.MediaItem{
 		MediaKey:  mediaKey,
 		FileName:  path.Base(remote),
 		SizeBytes: size,
+		DedupKey:  localDedupKey,
 	}
-	if cachedItem, err := f.cache.GetByMediaKey(mediaKey); err == nil {
+
+	if cachedItem, err := f.cache.GetByDedupKey(localDedupKey); err == nil {
 		media = *cachedItem
+	} else if cachedItem, err := f.cache.GetByMediaKey(mediaKey); err == nil {
+		media = *cachedItem
+	}
+
+	if strings.ToLower(f.opt.ListMode) == "description_path" || strings.ToLower(f.opt.ListMode) == "description" {
+		if media.DedupKey != "" {
+			fullPath := path.Join(f.root, remote)
+			dir := path.Dir(fullPath)
+			if dir == "." || dir == "/" {
+				dir = ""
+			}
+
+			caption := media.Caption
+			pathsStr := ""
+			idx := strings.Index(caption, "{paths:[")
+			if idx != -1 {
+				endIdx := strings.Index(caption[idx:], "]}")
+				if endIdx != -1 {
+					pathsStr = caption[idx+len("{paths:[") : idx+endIdx]
+					caption = caption[:idx] + caption[idx+endIdx+2:]
+				}
+			} else {
+				idx = strings.Index(caption, "[paths:")
+				if idx != -1 {
+					endIdx := strings.Index(caption[idx:], "]")
+					if endIdx != -1 {
+						pathsStr = caption[idx+len("[paths:") : idx+endIdx]
+						caption = caption[:idx] + caption[idx+endIdx+1:]
+					}
+				} else {
+					idx = strings.Index(caption, "[path:")
+					if idx != -1 {
+						endIdx := strings.Index(caption[idx:], "]")
+						if endIdx != -1 {
+							pathsStr = caption[idx+len("[path:") : idx+endIdx]
+							caption = caption[:idx] + caption[idx+endIdx+1:]
+						}
+					}
+				}
+			}
+
+			caption = strings.TrimSpace(caption)
+
+			pathList := []string{}
+			if pathsStr != "" {
+				parts := strings.Split(pathsStr, ",")
+				for _, p := range parts {
+					p = strings.TrimSpace(p)
+					p = strings.TrimPrefix(p, "\"")
+					p = strings.TrimSuffix(p, "\"")
+					p = strings.TrimSpace(p)
+					if p != "" {
+						pathList = append(pathList, p)
+					}
+				}
+			}
+
+			newPath := "/"
+			if dir != "" {
+				newPath = fmt.Sprintf("/%s", dir)
+			}
+
+			exists := false
+			for _, p := range pathList {
+				if p == newPath {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				pathList = append(pathList, newPath)
+			}
+
+			if len(pathList) > 0 {
+				if caption != "" {
+					caption += " "
+				}
+				var quotedPaths []string
+				for _, p := range pathList {
+					quotedPaths = append(quotedPaths, fmt.Sprintf(`"%s"`, p))
+				}
+				caption += fmt.Sprintf("{paths:[%s]}", strings.Join(quotedPaths, ","))
+			}
+
+			if caption != media.Caption {
+				err := f.api.SetCaption(ctx, media.DedupKey, caption)
+				if err != nil {
+					fs.Debugf(f, "Failed to set description path for %q: %v", remote, err)
+				} else {
+					media.Caption = caption
+					_ = f.cache.UpsertItems([]api.MediaItem{media})
+				}
+			}
+		}
 	}
 
 	return &Object{
@@ -1134,10 +1307,106 @@ func (o *Object) Remove(ctx context.Context) error {
 	if !o.hasMedia || o.media.DedupKey == "" {
 		return errors.New("no dedup key available for trash operation")
 	}
-	err := o.fs.api.MoveToTrash(ctx, []string{o.media.DedupKey})
-	if err != nil {
-		return err
+
+	isDescMode := strings.ToLower(o.fs.opt.ListMode) == "description_path" || strings.ToLower(o.fs.opt.ListMode) == "description"
+	var pathList []string
+	var caption string
+
+	if isDescMode {
+		caption = o.media.Caption
+		pathsStr := ""
+		idx := strings.Index(caption, "{paths:[")
+		if idx != -1 {
+			endIdx := strings.Index(caption[idx:], "]}")
+			if endIdx != -1 {
+				pathsStr = caption[idx+len("{paths:[") : idx+endIdx]
+				caption = caption[:idx] + caption[idx+endIdx+2:]
+			}
+		} else {
+			idx = strings.Index(caption, "[paths:")
+			if idx != -1 {
+				endIdx := strings.Index(caption[idx:], "]")
+				if endIdx != -1 {
+					pathsStr = caption[idx+len("[paths:") : idx+endIdx]
+					caption = caption[:idx] + caption[idx+endIdx+1:]
+				}
+			} else {
+				idx = strings.Index(caption, "[path:")
+				if idx != -1 {
+					endIdx := strings.Index(caption[idx:], "]")
+					if endIdx != -1 {
+						pathsStr = caption[idx+len("[path:") : idx+endIdx]
+						caption = caption[:idx] + caption[idx+endIdx+1:]
+					}
+				}
+			}
+		}
+
+		caption = strings.TrimSpace(caption)
+
+		if pathsStr != "" {
+			parts := strings.Split(pathsStr, ",")
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				p = strings.TrimPrefix(p, "\"")
+				p = strings.TrimSuffix(p, "\"")
+				p = strings.TrimSpace(p)
+				if p != "" {
+					pathList = append(pathList, p)
+				}
+			}
+		}
+
+		// Find the path we are trying to remove
+		currentDir := path.Dir(o.remote)
+		if currentDir == "." || currentDir == "/" {
+			currentDir = ""
+		}
+
+		targetPath := "/"
+		if currentDir != "" {
+			targetPath = fmt.Sprintf("/%s", currentDir)
+		}
+
+		// Remove the specific path from the array
+		var newPathList []string
+		for _, p := range pathList {
+			if p != targetPath {
+				newPathList = append(newPathList, p)
+			}
+		}
+		pathList = newPathList
 	}
+
+	// If not description mode, or if it was description mode but no paths remain
+	if !isDescMode || len(pathList) == 0 {
+		err := o.fs.api.MoveToTrash(ctx, []string{o.media.DedupKey})
+		if err != nil {
+			return err
+		}
+	} else {
+		// Just update the caption because it still exists in other folders
+		if len(pathList) > 0 {
+			if caption != "" {
+				caption += " "
+			}
+			var quotedPaths []string
+			for _, p := range pathList {
+				quotedPaths = append(quotedPaths, fmt.Sprintf(`"%s"`, p))
+			}
+			caption += fmt.Sprintf("{paths:[%s]}", strings.Join(quotedPaths, ","))
+		}
+
+		if caption != o.media.Caption {
+			err := o.fs.api.SetCaption(ctx, o.media.DedupKey, caption)
+			if err != nil {
+				return fmt.Errorf("failed to update description path on remove: %w", err)
+			}
+			o.media.Caption = caption
+			_ = o.fs.cache.UpsertItems([]api.MediaItem{o.media})
+		}
+	}
+
 	o.fs.cacheMu.Lock()
 	o.fs.forceSync = true
 	o.fs.cacheMu.Unlock()
