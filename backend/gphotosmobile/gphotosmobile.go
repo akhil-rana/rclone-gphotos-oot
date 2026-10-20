@@ -278,8 +278,24 @@ To clear the description:
 			Default: false,
 		}, {
 			Name:    "list_mode",
-			Help:    "Format to list files (e.g., flat, calendar, description_path).",
+			Help:    "Format to list files. Choose how files and directories are organized.",
 			Default: "flat",
+			Examples: []fs.OptionExample{{
+				Value: "flat",
+				Help:  "All photos and videos in the root directory (default)",
+			}, {
+				Value: "calendar",
+				Help:  "Nested date hierarchy (YYYY/YYYY-MM/YYYY-MM-DD/filename)",
+			}, {
+				Value: "month",
+				Help:  "Grouped by year and month (YYYY/YYYY-MM/filename)",
+			}, {
+				Value: "year",
+				Help:  "Grouped strictly by year (YYYY/filename)",
+			}, {
+				Value: "description_path",
+				Help:  "Virtual directories backed by caption tags {paths:[\"/dir\"]}",
+			}},
 		}, {
 			Name:     "apk_version",
 			Help:     "Google Photos APK version code to impersonate.\n\nThis is sent in the user agent and protobuf requests.\nUpdate if Google blocks older versions.",
