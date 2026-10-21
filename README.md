@@ -117,6 +117,18 @@ Google Photos does not support true folders natively. In `description_path` mode
 
 > [!NOTE]
 > **Initial Library Caching:** When you execute any operation (such as `rclone ls`) for the first time on a remote, Rclone performs an initial library sync to build your local metadata cache. For accounts containing thousands or tens of thousands of photos, this initial indexing step may take several minutes or more depending on library size and network speed. Once complete, all subsequent operations are near-instantaneous as Rclone only pulls quick incremental delta updates.
+>
+> <details>
+> <summary><b>Harmless Notice: <code>internal error: no overview data found</code></b> (Click to expand)</summary>
+>
+> You will notice the following message printed when running commands:
+> ```text
+> ERROR : internal error: no overview data found for "gphotosmobile"
+> ```
+> **This message is completely cosmetic and safe to ignore.**
+>
+> Upstream Rclone's internal registry expects embedded overview documentation metadata that is only generated during official in-tree Rclone builds. Because this backend operates as an independent out-of-tree plugin, this notice is emitted by Rclone's core registry and cannot be suppressed without modifying upstream Rclone. It has zero impact on functionality, reliability, or file transfers.
+> </details>
 
 ### List Files
 ```bash
