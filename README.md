@@ -42,12 +42,26 @@ An upstream pull request was proposed in [rclone/rclone#9135](https://github.com
 
 ## Setup & Configuration
 
-### 1. Build the Binary
-Clone the repository and build the custom Rclone executable:
+### 1. Get the Binary
+
+Choose one of the following methods to obtain the Rclone executable with the out-of-tree Google Photos backend:
+
+#### Option A: Download Pre-compiled Binary (Recommended)
+Download the latest pre-compiled release for your operating system and architecture from the **[Releases](https://github.com/akhil-rana/rclone-gphotos-oot/releases)** page:
+- **Linux:** `.tar.gz` binary archive, `.deb` package, or `.rpm` package.
+- **macOS:** `.zip` archive (`osx`).
+- **Windows:** `.zip` archive (`windows`).
+
+Extract the executable (or install the package) and proceed directly to **Step 2**.
+
+#### Option B: Build from Source
+If you have Go installed and prefer to build the binary yourself, clone the repository and run:
 
 ```bash
 go build -o rclone rclone.go
 ```
+
+---
 
 ### 2. Configure a New Remote
 Launch Rclone's interactive configuration menu:
