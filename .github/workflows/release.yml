@@ -39,7 +39,7 @@ jobs:
           echo "Target Release Version: ${VER}"
 
   build:
-    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    name: Build (${{ matrix.target_os }}/${{ matrix.goarch }})
     needs: prepare
     runs-on: ubuntu-latest
     strategy:
@@ -48,22 +48,22 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-            archive_format: tar.gz
+            target_os: linux
           - goos: linux
             goarch: arm64
-            archive_format: tar.gz
+            target_os: linux
           - goos: darwin
             goarch: amd64
-            archive_format: tar.gz
+            target_os: osx
           - goos: darwin
             goarch: arm64
-            archive_format: tar.gz
+            target_os: osx
           - goos: windows
             goarch: amd64
-            archive_format: zip
+            target_os: windows
           - goos: windows
             goarch: arm64
-            archive_format: zip
+            target_os: windows
 
     steps:
       - name: Checkout repository
@@ -74,32 +74,66 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Build & Package
+      - name: Install packaging tools
+        if: matrix.goos == 'linux'
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build & Package inside build/
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          mkdir -p bin release_assets
+          mkdir -p build/bin build/release_assets
           bin_name="rclone"
           if [ "${{ matrix.goos }}" = "windows" ]; then
             bin_name="rclone.exe"
           fi
 
+          # Build binary inside build/bin
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -v -trimpath -ldflags="-s -w" -o "bin/${bin_name}" rclone.go
+            go build -v -trimpath -ldflags="-s -w" -o "build/bin/${bin_name}" rclone.go
 
-          archive_base="rclone-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          archive_base="rclone-${VERSION}-${{ matrix.target_os }}-${{ matrix.goarch }}"
 
-          if [ "${{ matrix.archive_format }}" = "zip" ]; then
-            (cd bin && zip "../release_assets/${archive_base}.zip" "${bin_name}")
-          else
-            tar -czvf "release_assets/${archive_base}.tar.gz" -C bin "${bin_name}"
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            # 1. Standard Linux executable inside .tar.gz
+            tar -czvf "build/release_assets/${archive_base}.tar.gz" -C build/bin "${bin_name}"
+
+            # 2. Build .deb and .rpm packages using nfpm
+            clean_ver="${VERSION#v}"
+            cat <<EOF > build/nfpm.yaml
+          name: "rclone"
+          arch: "${{ matrix.goarch }}"
+          platform: "linux"
+          version: "${clean_ver}"
+          section: "default"
+          priority: "extra"
+          maintainer: "Rclone Google Photos OOT"
+          description: "Rclone with Google Photos Mobile Out-of-Tree Backend"
+          vendor: "rclone"
+          homepage: "https://github.com/rclone/rclone"
+          license: "MIT"
+          contents:
+            - src: ./build/bin/rclone
+              dst: /usr/bin/rclone
+          EOF
+            nfpm package --config build/nfpm.yaml --packager deb --target "build/release_assets/rclone-${VERSION}-linux-${{ matrix.goarch }}.deb"
+            nfpm package --config build/nfpm.yaml --packager rpm --target "build/release_assets/rclone-${VERSION}-linux-${{ matrix.goarch }}.rpm"
+
+          elif [ "${{ matrix.goos }}" = "darwin" ]; then
+            # macOS: zip archive called osx
+            (cd build/bin && zip "../release_assets/${archive_base}.zip" "${bin_name}")
+
+          elif [ "${{ matrix.goos }}" = "windows" ]; then
+            # Windows: zip archive
+            (cd build/bin && zip "../release_assets/${archive_base}.zip" "${bin_name}")
           fi
 
-      - name: Upload Build Artifact
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: assets-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: release_assets/*
+          name: assets-${{ matrix.target_os }}-${{ matrix.goarch }}
+          path: build/release_assets/*
 
   release:
     name: Publish GitHub Release
@@ -112,13 +146,13 @@ jobs:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: release_assets
+          path: build/release_assets
           pattern: assets-*
           merge-multiple: true
 
       - name: Generate Checksums
         run: |
-          cd release_assets
+          cd build/release_assets
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
@@ -126,9 +160,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.version }}
-          name: "Rclone Google Photos Mobile ${{ needs.prepare.outputs.version }}"
+          name: "Rclone Google Photos OOT ${{ needs.prepare.outputs.version }}"
           draft: false
           prerelease: false
           files: |
-            release_assets/*
+            build/release_assets/*
           generate_release_notes: true

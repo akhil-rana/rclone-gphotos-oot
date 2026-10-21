@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    name: Build (${{ matrix.target_os }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -13,21 +13,27 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            target_os: linux
             ext: ""
           - goos: linux
             goarch: arm64
+            target_os: linux
             ext: ""
           - goos: darwin
             goarch: amd64
+            target_os: osx
             ext: ""
           - goos: darwin
             goarch: arm64
+            target_os: osx
             ext: ""
           - goos: windows
             goarch: amd64
+            target_os: windows
             ext: ".exe"
           - goos: windows
             goarch: arm64
+            target_os: windows
             ext: ".exe"
 
     steps:
@@ -39,16 +45,16 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Build binary
+      - name: Build binary inside build/
         run: |
-          mkdir -p dist
-          output_name="rclone-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          mkdir -p build/dist
+          output_name="rclone-${{ matrix.target_os }}-${{ matrix.goarch }}${{ matrix.ext }}"
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -v -trimpath -ldflags="-s -w" -o "dist/${output_name}" rclone.go
+            go build -v -trimpath -ldflags="-s -w" -o "build/dist/${output_name}" rclone.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rclone-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
+          name: rclone-${{ matrix.target_os }}-${{ matrix.goarch }}
+          path: build/dist/*
           if-no-files-found: error
