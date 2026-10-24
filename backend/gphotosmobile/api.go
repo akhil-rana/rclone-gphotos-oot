@@ -336,7 +336,7 @@ func (a *MobileAPI) doProtoRequestOnce(ctx context.Context, urlStr string, body 
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := readResponseBody(resp)
 		return nil, &api.Error{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 
@@ -552,11 +552,11 @@ func (a *MobileAPI) CommitUpload(ctx context.Context, uploadResponse []byte, fil
 
 	f1, err := root.GetMessage(1)
 	if err != nil {
-		return "", fmt.Errorf("upload rejected: no field1")
+		return "", fmt.Errorf("upload rejected: no field1 (root: %+v)", root)
 	}
 	f13, err := f1.GetMessage(3)
 	if err != nil {
-		return "", fmt.Errorf("upload rejected: no field3")
+		return "", fmt.Errorf("upload rejected: no field3 (f1: %+v)", f1)
 	}
 	mediaKey := f13.GetString(1)
 	if mediaKey == "" {
@@ -574,6 +574,29 @@ func (a *MobileAPI) MoveToTrash(ctx context.Context, dedupKeys []string) error {
 	body := buildMoveToTrashRequest(dedupKeys, a.apkVersion, a.androidAPI)
 	_, err := a.doProtoRequest(ctx,
 		"https://photosdata-pa.googleapis.com/6439526531001121323/17490284929287180316",
+		body,
+	)
+	return err
+}
+
+// RestoreFromTrash restores items from trash by their dedup keys.
+func (a *MobileAPI) RestoreFromTrash(ctx context.Context, dedupKeys []string) error {
+	body := buildRestoreFromTrashRequest(dedupKeys, a.apkVersion, a.androidAPI)
+	_, err := a.doProtoRequest(ctx,
+		"https://photosdata-pa.googleapis.com/6439526531001121323/17490284929287180316",
+		body,
+	)
+	return err
+}
+
+// AddMediaToAlbum adds media items to an existing album by its album media key.
+func (a *MobileAPI) AddMediaToAlbum(ctx context.Context, albumMediaKey string, mediaKeys []string) error {
+	if albumMediaKey == "" || len(mediaKeys) == 0 {
+		return nil
+	}
+	body := buildAddMediaToAlbumRequest(albumMediaKey, mediaKeys, a.model, a.deviceMake, a.androidAPI)
+	_, err := a.doProtoRequest(ctx,
+		"https://photosdata-pa.googleapis.com/6439526531001121323/484917746253879292",
 		body,
 	)
 	return err

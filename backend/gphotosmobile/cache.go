@@ -46,7 +46,79 @@ import (
 
 // Cache wraps SQLite storage for the media library index
 type Cache struct {
-	db *sql.DB
+	db       *sql.DB
+	albumIDs []string
+}
+
+// SetAlbumFilter sets an album ID filter for all subsequent queries
+func (c *Cache) SetAlbumFilter(albumIDs []string) {
+	c.albumIDs = albumIDs
+}
+
+func (c *Cache) buildAlbumClause() (string, []any) {
+	if len(c.albumIDs) == 0 {
+		return "", nil
+	}
+	placeholders := strings.Repeat("?,", len(c.albumIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, len(c.albumIDs))
+	for i, id := range c.albumIDs {
+		args[i] = id
+	}
+	return fmt.Sprintf(" AND collection_id IN (%s)", placeholders), args
+}
+
+// CountItemsInAlbum returns the number of active (non-trashed) items in the given album
+func (c *Cache) CountItemsInAlbum(albumID string) (int, error) {
+	var count int
+	err := c.db.QueryRow(`SELECT count(*) FROM remote_media WHERE collection_id = ? AND (trash_timestamp = 0 OR trash_timestamp IS NULL)`, albumID).Scan(&count)
+	return count, err
+}
+
+// CheckTotalAlbumCapacity checks if the sum of all free slots across all configured albums can accommodate neededItems.
+func (c *Cache) CheckTotalAlbumCapacity(albumIDs []string, maxPerAlbum int, neededItems int) error {
+	if len(albumIDs) == 0 {
+		return nil
+	}
+	totalFree := 0
+	var statuses []string
+	for _, id := range albumIDs {
+		count, err := c.CountItemsInAlbum(id)
+		if err != nil {
+			return fmt.Errorf("failed to check item count for album %s: %w", id, err)
+		}
+		free := 0
+		if count < maxPerAlbum {
+			free = maxPerAlbum - count
+		}
+		totalFree += free
+		statuses = append(statuses, fmt.Sprintf("%s (%d/%d items, %d slots free)", id, count, maxPerAlbum, free))
+	}
+	if totalFree < neededItems {
+		return fmt.Errorf("insufficient album capacity: upload requires %d items/chunks, but all %d configured albums combined only have %d free slots remaining (max %d items per album). Album status: [%s]. Please add more album IDs to album_ids or increase max_items_per_album",
+			neededItems, len(albumIDs), totalFree, maxPerAlbum, strings.Join(statuses, ", "))
+	}
+	return nil
+}
+
+// GetActiveUploadAlbum selects the first album in albumIDs that currently has free space (count < maxPerAlbum).
+func (c *Cache) GetActiveUploadAlbum(albumIDs []string, maxPerAlbum int) (string, error) {
+	if len(albumIDs) == 0 {
+		return "", nil
+	}
+	var statuses []string
+	for _, id := range albumIDs {
+		count, err := c.CountItemsInAlbum(id)
+		if err != nil {
+			return "", fmt.Errorf("failed to check item count for album %s: %w", id, err)
+		}
+		if count < maxPerAlbum {
+			return id, nil
+		}
+		statuses = append(statuses, fmt.Sprintf("%s (%d/%d full)", id, count, maxPerAlbum))
+	}
+	return "", fmt.Errorf("all %d configured albums are full (exceeded %d items limit per album: [%s]). Please add a new album ID to album_ids or increase max_items_per_album to continue",
+		len(albumIDs), maxPerAlbum, strings.Join(statuses, ", "))
 }
 
 // NewCache opens or creates the SQLite cache database
@@ -151,6 +223,9 @@ func (c *Cache) createTables() error {
 		return fmt.Errorf("failed to create index: %w", err)
 	}
 
+	// Create index on collection_id for album lookups
+	_, _ = c.db.Exec(`CREATE INDEX IF NOT EXISTS idx_collection_id ON remote_media(collection_id)`)
+
 	return nil
 }
 
@@ -198,7 +273,7 @@ func (c *Cache) UpsertItems(items []api.MediaItem) error {
 		is_canonical=excluded.is_canonical,
 		type=excluded.type,
 		caption=excluded.caption,
-		collection_id=excluded.collection_id,
+		collection_id=CASE WHEN excluded.collection_id != '' THEN excluded.collection_id ELSE remote_media.collection_id END,
 		size_bytes=excluded.size_bytes,
 		quota_charged_bytes=excluded.quota_charged_bytes,
 		origin=excluded.origin,
@@ -285,7 +360,7 @@ func (c *Cache) DeleteItems(mediaKeys []string) error {
 
 // GetByFileName retrieves a media item by filename
 func (c *Cache) GetByFileName(fileName string) (*api.MediaItem, error) {
-	row := c.db.QueryRow(`SELECT
+	query := `SELECT
 		media_key, file_name, dedup_key, is_canonical, type, caption,
 		collection_id, size_bytes, quota_charged_bytes, origin,
 		content_version, utc_timestamp, server_creation_timestamp,
@@ -295,14 +370,21 @@ func (c *Cache) GetByFileName(fileName string) (*api.MediaItem, error) {
 		location_id, is_edited, make, model, aperture, shutter_speed,
 		iso, focal_length, duration, capture_frame_rate, encoded_frame_rate,
 		is_micro_video, micro_video_width, micro_video_height, sha1_hash
-	FROM remote_media WHERE file_name = ? LIMIT 1`, fileName)
+	FROM remote_media WHERE file_name = ? AND (trash_timestamp = 0 OR trash_timestamp IS NULL)`
+	args := []any{fileName}
+	clause, albumArgs := c.buildAlbumClause()
+	query += clause
+	args = append(args, albumArgs...)
+	query += ` LIMIT 1`
 
+	row := c.db.QueryRow(query, args...)
 	return scanMediaItem(row)
 }
 
-// GetByDedupKey looks up a media item by its dedup_key
-func (c *Cache) GetByDedupKey(dedupKey string) (*api.MediaItem, error) {
-	row := c.db.QueryRow(`SELECT
+// GetByBinaryName retrieves a media item whose caption metadata specifies the original binary filename
+func (c *Cache) GetByBinaryName(binaryName string) (*api.MediaItem, error) {
+	searchPattern := fmt.Sprintf(`%%"name":"%s"%%`, binaryName)
+	query := `SELECT
 		media_key, file_name, dedup_key, is_canonical, type, caption,
 		collection_id, size_bytes, quota_charged_bytes, origin,
 		content_version, utc_timestamp, server_creation_timestamp,
@@ -312,8 +394,74 @@ func (c *Cache) GetByDedupKey(dedupKey string) (*api.MediaItem, error) {
 		location_id, is_edited, make, model, aperture, shutter_speed,
 		iso, focal_length, duration, capture_frame_rate, encoded_frame_rate,
 		is_micro_video, micro_video_width, micro_video_height, sha1_hash
-	FROM remote_media WHERE dedup_key = ? LIMIT 1`, dedupKey)
+	FROM remote_media WHERE (trash_timestamp = 0 OR trash_timestamp IS NULL) AND caption LIKE ?`
+	args := []any{searchPattern}
+	clause, albumArgs := c.buildAlbumClause()
+	query += clause
+	args = append(args, albumArgs...)
+	query += ` ORDER BY file_name ASC LIMIT 1`
 
+	row := c.db.QueryRow(query, args...)
+	return scanMediaItem(row)
+}
+
+// GetChunksByBinaryName retrieves all chunk items belonging to a chunked binary file
+func (c *Cache) GetChunksByBinaryName(binaryName string) ([]api.MediaItem, error) {
+	searchPattern := fmt.Sprintf(`%%"name":"%s"%%`, binaryName)
+	query := `SELECT
+		media_key, file_name, dedup_key, is_canonical, type, caption,
+		collection_id, size_bytes, quota_charged_bytes, origin,
+		content_version, utc_timestamp, server_creation_timestamp,
+		timezone_offset, width, height, remote_url, upload_status,
+		trash_timestamp, is_archived, is_favorite, is_locked,
+		is_original_quality, latitude, longitude, location_name,
+		location_id, is_edited, make, model, aperture, shutter_speed,
+		iso, focal_length, duration, capture_frame_rate, encoded_frame_rate,
+		is_micro_video, micro_video_width, micro_video_height, sha1_hash
+	FROM remote_media WHERE (trash_timestamp = 0 OR trash_timestamp IS NULL) AND caption LIKE ?`
+	args := []any{searchPattern}
+	clause, albumArgs := c.buildAlbumClause()
+	query += clause
+	args = append(args, albumArgs...)
+	query += ` ORDER BY file_name ASC`
+
+	rows, err := c.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var items []api.MediaItem
+	for rows.Next() {
+		item, err := scanMediaItemFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, *item)
+	}
+	return items, rows.Err()
+}
+
+// GetByDedupKey looks up a media item by its dedup_key, preferring active (non-trashed) canonical items
+func (c *Cache) GetByDedupKey(dedupKey string) (*api.MediaItem, error) {
+	query := `SELECT
+		media_key, file_name, dedup_key, is_canonical, type, caption,
+		collection_id, size_bytes, quota_charged_bytes, origin,
+		content_version, utc_timestamp, server_creation_timestamp,
+		timezone_offset, width, height, remote_url, upload_status,
+		trash_timestamp, is_archived, is_favorite, is_locked,
+		is_original_quality, latitude, longitude, location_name,
+		location_id, is_edited, make, model, aperture, shutter_speed,
+		iso, focal_length, duration, capture_frame_rate, encoded_frame_rate,
+		is_micro_video, micro_video_width, micro_video_height, sha1_hash
+	FROM remote_media WHERE (dedup_key = ? OR media_key = ?)`
+	args := []any{dedupKey, dedupKey}
+	clause, albumArgs := c.buildAlbumClause()
+	query += clause
+	args = append(args, albumArgs...)
+	query += ` ORDER BY (trash_timestamp = 0 OR trash_timestamp IS NULL) DESC, is_canonical DESC LIMIT 1`
+
+	row := c.db.QueryRow(query, args...)
 	return scanMediaItem(row)
 }
 
@@ -336,7 +484,7 @@ func (c *Cache) GetByMediaKey(mediaKey string) (*api.MediaItem, error) {
 
 // ListAll returns all non-trashed media items
 func (c *Cache) ListAll() ([]api.MediaItem, error) {
-	rows, err := c.db.Query(`SELECT
+	query := `SELECT
 		media_key, file_name, dedup_key, is_canonical, type, caption,
 		collection_id, size_bytes, quota_charged_bytes, origin,
 		content_version, utc_timestamp, server_creation_timestamp,
@@ -346,8 +494,14 @@ func (c *Cache) ListAll() ([]api.MediaItem, error) {
 		location_id, is_edited, make, model, aperture, shutter_speed,
 		iso, focal_length, duration, capture_frame_rate, encoded_frame_rate,
 		is_micro_video, micro_video_width, micro_video_height, sha1_hash
-	FROM remote_media WHERE trash_timestamp = 0 OR trash_timestamp IS NULL
-	ORDER BY utc_timestamp DESC`)
+	FROM remote_media WHERE (trash_timestamp = 0 OR trash_timestamp IS NULL)`
+	var args []any
+	clause, albumArgs := c.buildAlbumClause()
+	query += clause
+	args = append(args, albumArgs...)
+	query += ` ORDER BY utc_timestamp DESC`
+
+	rows, err := c.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}

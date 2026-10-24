@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -22,11 +24,86 @@ import (
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/user/rclone-gphotos-oot/backend/gphotosmobile/api"
+	"github.com/user/rclone-gphotos-oot/backend/gphotosmobile/binary"
 )
 
 var (
 	errCantRmdir = errors.New("can't remove virtual directory")
 )
+
+type captionPayload struct {
+	Paths         []string              `json:"paths"`
+	BinaryDetails *binary.BinaryDetails `json:"binaryDetails,omitempty"`
+}
+
+// ParseCaption parses virtual paths and binaryDetails from a Google Photos caption.
+func ParseCaption(caption string) ([]string, *binary.BinaryDetails) {
+	return parseCaption(caption)
+}
+
+func parseCaption(caption string) ([]string, *binary.BinaryDetails) {
+	if caption == "" {
+		return nil, nil
+	}
+
+	var p captionPayload
+	if err := json.Unmarshal([]byte(caption), &p); err == nil {
+		return p.Paths, p.BinaryDetails
+	}
+
+	// Normalize unquoted JSON keys: {paths: -> {"paths":, binaryDetails: -> "binaryDetails":
+	normalized := caption
+	normalized = strings.ReplaceAll(normalized, "{paths:", "{\"paths\":")
+	normalized = strings.ReplaceAll(normalized, ",paths:", ",\"paths\":")
+	normalized = strings.ReplaceAll(normalized, ",binaryDetails:", ",\"binaryDetails\":")
+	normalized = strings.ReplaceAll(normalized, "{binaryDetails:", "{\"binaryDetails\":")
+
+	start := strings.Index(normalized, "{")
+	end := strings.LastIndex(normalized, "}")
+	if start != -1 && end != -1 && end > start {
+		if err := json.Unmarshal([]byte(normalized[start:end+1]), &p); err == nil {
+			return p.Paths, p.BinaryDetails
+		}
+	}
+
+	// Fallback extraction of paths from any format: {paths:[...]}, [paths:...], [path:...]
+	var paths []string
+	extractPaths := func(prefix string, closeChar string) bool {
+		idx := strings.Index(caption, prefix)
+		if idx != -1 {
+			endIdx := strings.Index(caption[idx:], closeChar)
+			if endIdx != -1 {
+				raw := caption[idx+len(prefix) : idx+endIdx]
+				for _, part := range strings.Split(raw, ",") {
+					part = strings.Trim(strings.TrimSpace(part), "\"'")
+					if part != "" {
+						paths = append(paths, part)
+					}
+				}
+				return true
+			}
+		}
+		return false
+	}
+
+	if extractPaths("{paths:[", "]") || extractPaths("[paths:", "]") || extractPaths("[path:", "]") || extractPaths("paths:[", "]") {
+		return paths, nil
+	}
+
+	return nil, nil
+}
+
+func buildCaption(paths []string, binDetails *binary.BinaryDetails) string {
+	payload := captionPayload{
+		Paths:         paths,
+		BinaryDetails: binDetails,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
 
 var systemMetadataInfo = map[string]fs.MetadataHelp{
 	"description": {
@@ -312,6 +389,51 @@ To clear the description:
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name:     "support_binary_data",
+			Help:     "[BETA] Enable storing arbitrary binary data (archives, documents, executables) by encoding them into lossless uncompressed RGB24 media (PNG/MKV).\n\nWhen disabled (the default), only native photo and video files are supported.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "encode_all_as_binary",
+			Help:     "When support_binary_data is enabled, force binary RGB24 encoding for all files, including native photos and videos (.jpg, .mp4, etc.).\n\nWhen disabled (the default), native media files are uploaded directly without binary encoding.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "binary_data_chunking",
+			Help:     "Enable splitting large binary files into smaller media chunks for fast random seeking (virtual HTTP Range support).\n\nRequires support_binary_data to be enabled.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "binary_data_chunk_size",
+			Help:     "Chunk size for binary data chunking. Must be between 32M and 512M.\n\nRecommended: 64M. Smaller chunks improve seeking speed at the cost of more individual uploads.",
+			Default:  fs.SizeSuffix(64 * 1024 * 1024),
+			Advanced: true,
+		}, {
+			Name:     "binary_data_chunk_concurrency",
+			Help:     "Concurrency for uploading binary data chunks in parallel. Must be between 1 and 16.\n\nDefault: 4. Higher values saturate fast network connections during chunked uploads.",
+			Default:  4,
+			Advanced: true,
+		}, {
+			Name:     "binary_video_resolution",
+			Help:     "Target video resolution for binary MKV containers (from 240p to 4096p).\n\nOptions:\n  auto    - Automatically choose the best resolution that guarantees at least 1s duration and minimizes padding (default)\n  240p    - 426x240 (min ~7MB for 1s)\n  360p    - 640x360 (min ~16MB for 1s)\n  480p    - 854x480 (min ~29MB for 1s)\n  720p    - 1280x720 (min ~64MB for 1s)\n  1080p   - 1920x1080 (min ~143MB for 1s)\n  1440p   - 2560x1440 (min ~254MB for 1s)\n  4K      - 3840x2160 (min ~570MB for 1s)\n  4096p   - 4096x2160 (min ~608MB for 1s)\n\nNote: Videos must be at least 1 second long. If chunking is enabled, the resolution must fit within binary_data_chunk_size.",
+			Default:  "auto",
+			Advanced: true,
+		}, {
+			Name:     "min_size_needed_for_binary_video",
+			Help:     "Minimum file size to encode as an MKV video instead of a PNG image. Must be between 5M and 50M.\n\nFiles smaller than this threshold are stored as lossless uncompressed PNG images; larger files are stored as MKV videos.\n\nDefault: 10M.",
+			Default:  fs.SizeSuffix(10 * 1024 * 1024),
+			Advanced: true,
+		}, {
+			Name:     "album_ids",
+			Help:     "Comma-separated list of Google Photos Album IDs to scope this remote to (e.g. AF1Qip1,AF1Qip2).\n\nLeave empty to access the entire library.\n\nWhen configured, 'rclone ls' lists items from all listed albums. Uploads fill each album sequentially up to max_items_per_album before spilling over to the next album in the list.\n\nTo find an Album ID, open the album at photos.google.com and copy the ID from the URL: photos.google.com/album/<ALBUM_ID>",
+			Default:  "",
+			Advanced: false,
+		}, {
+			Name:     "max_items_per_album",
+			Help:     "Maximum number of items allowed in an album before spilling over to the next album in album_ids. Google Photos hard limit is 20,000.\n\nDefault: 20000.",
+			Default:  20000,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -324,16 +446,26 @@ To clear the description:
 
 // Options defines the configuration for this backend
 type Options struct {
-	AuthData        string               `config:"auth_data"`
-	CacheDBPath     string               `config:"cache_db_path"`
-	DeviceModel     string               `config:"device_model"`
-	DeviceMake      string               `config:"device_make"`
-	UnlimitedUpload bool                 `config:"unlimited_upload"`
-	ListMode        string               `config:"list_mode"`
-	APKVersion      int64                `config:"apk_version"`
-	AndroidAPI      int64                `config:"android_api"`
-	DownloadCache   bool                 `config:"download_cache"`
-	Enc             encoder.MultiEncoder `config:"encoding"`
+	AuthData                    string               `config:"auth_data"`
+	CacheDBPath                 string               `config:"cache_db_path"`
+	DeviceModel                 string               `config:"device_model"`
+	DeviceMake                  string               `config:"device_make"`
+	UnlimitedUpload             bool                 `config:"unlimited_upload"`
+	ListMode                    string               `config:"list_mode"`
+	APKVersion                  int64                `config:"apk_version"`
+	AndroidAPI                  int64                `config:"android_api"`
+	DownloadCache               bool                 `config:"download_cache"`
+	SupportBinaryData           bool                 `config:"support_binary_data"`
+	EncodeAllAsBinary           bool                 `config:"encode_all_as_binary"`
+	BinaryDataChunking          bool                 `config:"binary_data_chunking"`
+	BinaryDataChunkSize         fs.SizeSuffix        `config:"binary_data_chunk_size"`
+	BinaryDataChunkConcurrency  int                  `config:"binary_data_chunk_concurrency"`
+	BinaryVideoResolution       string               `config:"binary_video_resolution"`
+	MinSizeNeededForBinaryVideo fs.SizeSuffix        `config:"min_size_needed_for_binary_video"`
+	AlbumIDs                    string               `config:"album_ids"`
+	AlbumID                     string               `config:"album_id"` // Backward compatibility alias
+	MaxItemsPerAlbum            int                  `config:"max_items_per_album"`
+	Enc                         encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote Google Photos storage via mobile API
@@ -344,6 +476,7 @@ type Fs struct {
 	features  *fs.Features    // optional features
 	api       *MobileAPI      // mobile API client (includes pacer for rate limiting/retry)
 	cache     *Cache          // SQLite cache
+	albumIDs  []string        // parsed scoped album IDs
 	cacheMu   sync.Mutex      // protects cache operations
 	startTime time.Time       // time Fs was started
 	dlCache   *downloadCache  // shared download cache for temp files
@@ -352,10 +485,11 @@ type Fs struct {
 }
 
 type Object struct {
-	fs       *Fs           // parent Fs
-	remote   string        // remote path
-	media    api.MediaItem // cached media item info
-	hasMedia bool          // whether media info is populated
+	fs         *Fs                   // parent Fs
+	remote     string                // remote path
+	media      api.MediaItem         // cached media item info
+	hasMedia   bool                  // whether media info is populated
+	binDetails *binary.BinaryDetails // binary metadata from caption if present
 }
 
 // Fs interface methods
@@ -376,6 +510,50 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't parse config: %w", err)
+	}
+
+	if opt.BinaryDataChunking {
+		if !opt.SupportBinaryData {
+			return nil, errors.New("invalid configuration: binary_data_chunking cannot be enabled without support_binary_data")
+		}
+		minChunk := fs.SizeSuffix(32 * 1024 * 1024)
+		maxChunk := fs.SizeSuffix(512 * 1024 * 1024)
+		if opt.BinaryDataChunkSize < minChunk || opt.BinaryDataChunkSize > maxChunk {
+			return nil, fmt.Errorf("invalid configuration: binary_data_chunk_size %v is out of range: must be between 32M and 512M", opt.BinaryDataChunkSize)
+		}
+		if opt.BinaryDataChunkConcurrency < 1 || opt.BinaryDataChunkConcurrency > 16 {
+			return nil, fmt.Errorf("invalid configuration: binary_data_chunk_concurrency %d is out of range: must be between 1 and 16", opt.BinaryDataChunkConcurrency)
+		}
+	}
+
+	minVideoMin := fs.SizeSuffix(5 * 1024 * 1024)
+	minVideoMax := fs.SizeSuffix(50 * 1024 * 1024)
+	if opt.MinSizeNeededForBinaryVideo == 0 {
+		opt.MinSizeNeededForBinaryVideo = fs.SizeSuffix(10 * 1024 * 1024)
+	}
+	if opt.MinSizeNeededForBinaryVideo < minVideoMin || opt.MinSizeNeededForBinaryVideo > minVideoMax {
+		return nil, fmt.Errorf("invalid configuration: min_size_needed_for_binary_video %v is out of range: must be between 5M and 50M", opt.MinSizeNeededForBinaryVideo)
+	}
+
+	resName := strings.ToLower(strings.TrimSpace(opt.BinaryVideoResolution))
+	if resName == "" {
+		resName = "auto"
+	}
+	opt.BinaryVideoResolution = resName
+
+	if resName != "auto" {
+		targetRes, ok := binary.LookupResolution(resName)
+		if !ok {
+			return nil, fmt.Errorf("invalid configuration: binary_video_resolution %q is not recognized (valid: auto, 240p, 360p, 480p, 720p, 1080p, 1440p, 4K, 4096p)", opt.BinaryVideoResolution)
+		}
+		minBytes1Sec := targetRes.MinBytesFor1Sec()
+
+		if opt.BinaryDataChunking {
+			if int64(opt.BinaryDataChunkSize) < minBytes1Sec {
+				return nil, fmt.Errorf("invalid configuration: binary_video_resolution %q requires at least %v for 1 second of video at 24fps, but binary_data_chunk_size is %v. Choose a lower resolution (e.g. 240p, 360p, 480p) or increase chunk size",
+					opt.BinaryVideoResolution, fs.SizeSuffix(minBytes1Sec), opt.BinaryDataChunkSize)
+			}
+		}
 	}
 
 	authData := opt.AuthData
@@ -404,6 +582,28 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, fmt.Errorf("couldn't open cache database: %w", err)
 	}
+	if opt.AlbumIDs == "" && opt.AlbumID != "" {
+		opt.AlbumIDs = opt.AlbumID
+	}
+	var parsedAlbumIDs []string
+	if opt.AlbumIDs != "" {
+		for _, id := range strings.Split(opt.AlbumIDs, ",") {
+			id = strings.TrimSpace(id)
+			if idx := strings.Index(id, "AF1Qip"); idx >= 0 {
+				id = id[idx:]
+			}
+			id = strings.TrimRight(id, "/? \t\r\n")
+			if id != "" {
+				parsedAlbumIDs = append(parsedAlbumIDs, id)
+			}
+		}
+	}
+	if opt.MaxItemsPerAlbum <= 0 {
+		opt.MaxItemsPerAlbum = 20000
+	}
+	if len(parsedAlbumIDs) > 0 {
+		cache.SetAlbumFilter(parsedAlbumIDs)
+	}
 
 	f := &Fs{
 		name:      name,
@@ -411,6 +611,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:       *opt,
 		api:       api,
 		cache:     cache,
+		albumIDs:  parsedAlbumIDs,
 		startTime: time.Now(),
 	}
 	if opt.DownloadCache {
@@ -449,64 +650,36 @@ func (f *Fs) getVirtualPaths(item *api.MediaItem, fileName string) []string {
 	var itemPaths []string
 	tm := time.UnixMilli(item.UTCTimestamp).UTC()
 
-	switch strings.ToLower(f.opt.ListMode) {
-	case "year":
-		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%s", tm.Year(), fileName))
-	case "month", "year_month":
-		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), fileName))
-	case "calendar", "calender", "day", "week":
-		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%04d-%02d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), tm.Year(), tm.Month(), tm.Day(), fileName))
-	case "description_path", "description":
-		pathsStr := ""
-		idx := strings.Index(item.Caption, "{paths:[")
-		if idx != -1 {
-			endIdx := strings.Index(item.Caption[idx:], "]}")
-			if endIdx != -1 {
-				pathsStr = item.Caption[idx+len("{paths:[") : idx+endIdx]
-			}
-		} else {
-			idx = strings.Index(item.Caption, "[paths:")
-			if idx != -1 {
-				endIdx := strings.Index(item.Caption[idx:], "]")
-				if endIdx != -1 {
-					pathsStr = item.Caption[idx+len("[paths:") : idx+endIdx]
-				}
-			} else {
-				idx = strings.Index(item.Caption, "[path:")
-				if idx != -1 {
-					endIdx := strings.Index(item.Caption[idx:], "]")
-					if endIdx != -1 {
-						pathsStr = item.Caption[idx+len("[path:") : idx+endIdx]
-					}
-				}
-			}
-		}
-
-		if pathsStr != "" {
-			parts := strings.Split(pathsStr, ",")
-			for _, p := range parts {
-				p = strings.TrimSpace(p)
-				p = strings.TrimPrefix(p, "\"")
-				p = strings.TrimSuffix(p, "\"")
-				p = strings.TrimSpace(p)
-				p = strings.TrimPrefix(p, "/")
-				p = strings.TrimSuffix(p, "/")
-				if p != "" {
-					itemPaths = append(itemPaths, path.Join(p, fileName))
-				} else {
-					itemPaths = append(itemPaths, fileName)
-				}
-			}
-		} else {
-			itemPaths = append(itemPaths, fileName)
-		}
-	default: // "flat"
-		itemPaths = append(itemPaths, fileName)
+	parsedPaths, binDetails := parseCaption(item.Caption)
+	effectiveFileName := fileName
+	if f.opt.SupportBinaryData && binDetails != nil && binDetails.Name != "" {
+		effectiveFileName = binDetails.Name
 	}
 
-	// Apply f.root filtering if necessary, but actually for NewObject we might not need to if `remote` is already relative to f.root.
-	// Wait, `remote` in NewObject is relative to `f.root`.
-	// So we should return paths relative to `f.root`.
+	switch strings.ToLower(f.opt.ListMode) {
+	case "year":
+		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%s", tm.Year(), effectiveFileName))
+	case "month", "year_month":
+		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), effectiveFileName))
+	case "calendar", "calender", "day", "week":
+		itemPaths = append(itemPaths, fmt.Sprintf("%04d/%04d-%02d/%04d-%02d-%02d/%s", tm.Year(), tm.Year(), tm.Month(), tm.Year(), tm.Month(), tm.Day(), effectiveFileName))
+	case "description_path", "description":
+		if len(parsedPaths) > 0 {
+			for _, p := range parsedPaths {
+				p = strings.Trim(strings.TrimSpace(p), "/")
+				if p != "" {
+					itemPaths = append(itemPaths, path.Join(p, effectiveFileName))
+				} else {
+					itemPaths = append(itemPaths, effectiveFileName)
+				}
+			}
+		} else {
+			itemPaths = append(itemPaths, effectiveFileName)
+		}
+	default: // "flat"
+		itemPaths = append(itemPaths, effectiveFileName)
+	}
+
 	var relPaths []string
 	for _, p := range itemPaths {
 		if f.root != "" {
@@ -528,14 +701,20 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	_, fileName := path.Split(remote)
-
 	fileName = f.opt.Enc.ToStandardName(fileName)
 
 	item, err := f.cache.GetByFileName(fileName)
 	if errors.Is(err, sql.ErrNoRows) {
-		item, err = f.findByDedupSuffix(fileName)
-		if err != nil {
-			return nil, fs.ErrorObjectNotFound
+		if f.opt.SupportBinaryData {
+			item, err = f.cache.GetByBinaryName(fileName)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			item, err = f.findByDedupSuffix(fileName)
+			if err != nil {
+				return nil, fs.ErrorObjectNotFound
+			}
+		} else if err != nil {
+			return nil, fmt.Errorf("cache binary lookup failed: %w", err)
 		}
 	} else if err != nil {
 		return nil, fmt.Errorf("cache lookup failed: %w", err)
@@ -555,12 +734,32 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, fs.ErrorObjectNotFound
 	}
 
+	var binDetails *binary.BinaryDetails
+	if f.opt.SupportBinaryData {
+		_, binDetails = parseCaption(item.Caption)
+		if binDetails != nil && binDetails.ChunkDetails != nil {
+			chunks, err := f.cache.GetChunksByBinaryName(binDetails.Name)
+			if err != nil || len(chunks) < binDetails.ChunkDetails.TotalChunks {
+				// Incomplete chunked file!
+				return nil, fs.ErrorObjectNotFound
+			}
+		}
+	}
+
 	return &Object{
-		fs:       f,
-		remote:   remote,
-		media:    *item,
-		hasMedia: true,
+		fs:         f,
+		remote:     remote,
+		media:      *item,
+		hasMedia:   true,
+		binDetails: binDetails,
 	}, nil
+}
+
+func (f *Fs) getTargetAlbumID() (string, error) {
+	if len(f.albumIDs) == 0 {
+		return "", nil
+	}
+	return f.cache.GetActiveUploadAlbum(f.albumIDs, f.opt.MaxItemsPerAlbum)
 }
 
 func (f *Fs) findByDedupSuffix(fileName string) (*api.MediaItem, error) {
@@ -577,11 +776,23 @@ func (f *Fs) findByDedupSuffix(fileName string) (*api.MediaItem, error) {
 	}
 
 	item, err := f.cache.GetByDedupKey(suffix)
-	if err == nil {
+	if err == nil && (item.TrashTimestamp == 0) {
 		return item, nil
 	}
 	item, err = f.cache.GetByMediaKey(suffix)
-	if err == nil {
+	if err == nil && (item.TrashTimestamp == 0) {
+		if len(f.albumIDs) > 0 {
+			matched := false
+			for _, id := range f.albumIDs {
+				if item.CollectionID == id {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil, fs.ErrorObjectNotFound
+			}
+		}
 		return item, nil
 	}
 	return nil, fs.ErrorObjectNotFound
@@ -620,6 +831,17 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	items = dedupedItems
 
 	dirs := make(map[string]bool)
+	seenFiles := make(map[string]bool)
+	chunkCounts := make(map[string]int)
+
+	if f.opt.SupportBinaryData {
+		for _, item := range items {
+			_, bin := parseCaption(item.Caption)
+			if bin != nil && bin.ChunkDetails != nil {
+				chunkCounts[bin.Name]++
+			}
+		}
+	}
 
 	for _, item := range items {
 		if item.FileName == "" {
@@ -627,6 +849,16 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 
 		fileName := f.opt.Enc.FromStandardName(item.FileName)
+		var binDetails *binary.BinaryDetails
+		if f.opt.SupportBinaryData {
+			_, binDetails = parseCaption(item.Caption)
+			if binDetails != nil && binDetails.ChunkDetails != nil {
+				if chunkCounts[binDetails.Name] < binDetails.ChunkDetails.TotalChunks {
+					// Incomplete file, do not list until all chunks finish uploading
+					continue
+				}
+			}
+		}
 
 		itemPaths := f.getVirtualPaths(&item, fileName)
 
@@ -636,8 +868,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			// We check it against the requested `dir`.
 			if dir == "" {
 				if !strings.Contains(itemPath, "/") {
-					o := &Object{fs: f, remote: itemPath, media: item, hasMedia: true}
-					entries = append(entries, o)
+					if !seenFiles[itemPath] {
+						seenFiles[itemPath] = true
+						o := &Object{fs: f, remote: itemPath, media: item, hasMedia: true, binDetails: binDetails}
+						entries = append(entries, o)
+					}
 				} else {
 					dirName := strings.Split(itemPath, "/")[0]
 					if !dirs[dirName] {
@@ -649,8 +884,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				if strings.HasPrefix(itemPath, dir+"/") {
 					relPath := strings.TrimPrefix(itemPath, dir+"/")
 					if !strings.Contains(relPath, "/") {
-						o := &Object{fs: f, remote: itemPath, media: item, hasMedia: true}
-						entries = append(entries, o)
+						if !seenFiles[itemPath] {
+							seenFiles[itemPath] = true
+							o := &Object{fs: f, remote: itemPath, media: item, hasMedia: true, binDetails: binDetails}
+							entries = append(entries, o)
+						}
 					} else {
 						subDirName := strings.Split(relPath, "/")[0]
 						dirRemote := dir + "/" + subDirName
@@ -669,38 +907,72 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // Put uploads a file
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if err := f.cache.CheckTotalAlbumCapacity(f.albumIDs, f.opt.MaxItemsPerAlbum, 1); err != nil {
+		return nil, fmt.Errorf("album capacity check failed: %w", err)
+	}
+
 	remote := src.Remote()
 	size := src.Size()
 
-	hashStr, err := src.Hash(ctx, hash.SHA1)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get SHA1 hash: %w", err)
-	}
+	var binDetails *binary.BinaryDetails
+	uploadFileName := path.Base(remote)
+	var sha1Bytes []byte
+	var sha1B64 string
+	uploadIn := in
 
-	sha1Bytes, err := hex.DecodeString(hashStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid SHA1 hash hex: %w", err)
+	shouldEncodeBinary := f.opt.SupportBinaryData && (f.opt.EncodeAllAsBinary || !binary.IsNativeMedia(remote))
+	if shouldEncodeBinary {
+		if f.opt.BinaryDataChunking && size > int64(f.opt.BinaryDataChunkSize) {
+			return f.putChunkedBinary(ctx, in, src, remote, size)
+		}
+
+		unwrappedIn, wrap := accounting.UnWrap(in)
+		codecOpts := binary.CodecOptions{
+			MinVideoSize:    int64(f.opt.MinSizeNeededForBinaryVideo),
+			VideoResolution: f.opt.BinaryVideoResolution,
+		}
+		encoded, err := binary.Encode(unwrappedIn, remote, size, codecOpts)
+		if err != nil {
+			return nil, fmt.Errorf("binary encoding failed: %w", err)
+		}
+		defer encoded.Close()
+
+		uploadIn = wrap(encoded.File)
+		size = encoded.MediaSize
+		sha1B64 = encoded.MediaSHA1B64
+		sha1Bytes, _ = base64.StdEncoding.DecodeString(sha1B64)
+		uploadFileName = encoded.MediaFilename
+		binDetails = &encoded.Details
+	} else {
+		hashStr, err := src.Hash(ctx, hash.SHA1)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get SHA1 hash: %w", err)
+		}
+
+		sha1Bytes, err = hex.DecodeString(hashStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SHA1 hash hex: %w", err)
+		}
+		sha1B64 = base64.StdEncoding.EncodeToString(sha1Bytes)
 	}
-	sha1B64 := base64.StdEncoding.EncodeToString(sha1Bytes)
 
 	mediaKey, err := f.api.FindRemoteMediaByHash(ctx, sha1Bytes)
 	if err == nil && mediaKey != "" {
 		fs.Debugf(f, "File %q already exists with media key %s", remote, mediaKey)
-		_, _ = io.Copy(io.Discard, in)
+		_, _ = io.Copy(io.Discard, uploadIn)
 	} else {
 		uploadToken, err := f.api.GetUploadToken(ctx, sha1B64, size)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get upload token: %w", err)
 		}
 
-		uploadResp, err := f.api.UploadFile(ctx, in, size, uploadToken)
+		uploadResp, err := f.api.UploadFile(ctx, uploadIn, size, uploadToken)
 		if err != nil {
 			return nil, fmt.Errorf("upload failed: %w", err)
 		}
 
-		_, fileName := path.Split(remote)
-		fileName = f.opt.Enc.ToStandardName(fileName)
-		mediaKey, err = f.api.CommitUpload(ctx, uploadResp, fileName, sha1Bytes)
+		uploadFileName = f.opt.Enc.ToStandardName(uploadFileName)
+		mediaKey, err = f.api.CommitUpload(ctx, uploadResp, uploadFileName, sha1Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("commit upload failed: %w", err)
 		}
@@ -718,115 +990,491 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 	media := api.MediaItem{
 		MediaKey:  mediaKey,
-		FileName:  path.Base(remote),
+		FileName:  uploadFileName,
 		SizeBytes: size,
 		DedupKey:  localDedupKey,
 	}
 
-	if cachedItem, err := f.cache.GetByDedupKey(localDedupKey); err == nil {
+	if cachedItem, err := f.cache.GetByMediaKey(mediaKey); err == nil {
 		media = *cachedItem
-	} else if cachedItem, err := f.cache.GetByMediaKey(mediaKey); err == nil {
+	} else if cachedItem, err := f.cache.GetByDedupKey(localDedupKey); err == nil {
 		media = *cachedItem
+		media.MediaKey = mediaKey
 	}
 
-	if strings.ToLower(f.opt.ListMode) == "description_path" || strings.ToLower(f.opt.ListMode) == "description" {
-		if media.DedupKey != "" {
-			fullPath := path.Join(f.root, remote)
-			dir := path.Dir(fullPath)
-			if dir == "." || dir == "/" {
-				dir = ""
-			}
-
-			caption := media.Caption
-			pathsStr := ""
-			idx := strings.Index(caption, "{paths:[")
-			if idx != -1 {
-				endIdx := strings.Index(caption[idx:], "]}")
-				if endIdx != -1 {
-					pathsStr = caption[idx+len("{paths:[") : idx+endIdx]
-					caption = caption[:idx] + caption[idx+endIdx+2:]
-				}
+	if media.DedupKey != "" {
+		if media.TrashTimestamp > 0 {
+			// The item was previously moved to trash. Restore it on Google Photos!
+			if err := f.api.RestoreFromTrash(ctx, []string{media.DedupKey}); err != nil {
+				fs.Debugf(f, "Failed to restore %q from trash: %v", remote, err)
 			} else {
-				idx = strings.Index(caption, "[paths:")
-				if idx != -1 {
-					endIdx := strings.Index(caption[idx:], "]")
-					if endIdx != -1 {
-						pathsStr = caption[idx+len("[paths:") : idx+endIdx]
-						caption = caption[:idx] + caption[idx+endIdx+1:]
-					}
-				} else {
-					idx = strings.Index(caption, "[path:")
-					if idx != -1 {
-						endIdx := strings.Index(caption[idx:], "]")
-						if endIdx != -1 {
-							pathsStr = caption[idx+len("[path:") : idx+endIdx]
-							caption = caption[:idx] + caption[idx+endIdx+1:]
-						}
+				media.TrashTimestamp = 0
+			}
+		}
+
+		existingPaths, existingBin := parseCaption(media.Caption)
+		if binDetails == nil {
+			binDetails = existingBin
+			if binDetails == nil {
+				// Recover binaryDetails if another entry with this dedupKey had it
+				if otherItem, err := f.cache.GetByDedupKey(media.DedupKey); err == nil {
+					_, otherBin := parseCaption(otherItem.Caption)
+					if otherBin != nil {
+						binDetails = otherBin
 					}
 				}
 			}
+		}
 
-			caption = strings.TrimSpace(caption)
+		fullPath := path.Join(f.root, remote)
+		dir := path.Dir(fullPath)
+		if dir == "." || dir == "/" {
+			dir = ""
+		}
 
-			pathList := []string{}
-			if pathsStr != "" {
-				parts := strings.Split(pathsStr, ",")
-				for _, p := range parts {
-					p = strings.TrimSpace(p)
-					p = strings.TrimPrefix(p, "\"")
-					p = strings.TrimSuffix(p, "\"")
-					p = strings.TrimSpace(p)
-					if p != "" {
-						pathList = append(pathList, p)
-					}
-				}
+		newPath := "/"
+		if dir != "" {
+			newPath = fmt.Sprintf("/%s", dir)
+		}
+
+		pathList := existingPaths
+		exists := false
+		for _, p := range pathList {
+			if p == newPath {
+				exists = true
+				break
 			}
+		}
+		if !exists {
+			pathList = append(pathList, newPath)
+		}
 
-			newPath := "/"
-			if dir != "" {
-				newPath = fmt.Sprintf("/%s", dir)
-			}
+		newCaption := buildCaption(pathList, binDetails)
+		err := f.api.SetCaption(ctx, media.DedupKey, newCaption)
+		if err != nil {
+			fs.Debugf(f, "Failed to set caption for %q: %v", remote, err)
+		} else {
+			media.Caption = newCaption
+			media.TrashTimestamp = 0
+			_ = f.cache.UpsertItems([]api.MediaItem{media})
+		}
+	}
 
-			exists := false
-			for _, p := range pathList {
-				if p == newPath {
-					exists = true
-					break
-				}
-			}
-			if !exists {
-				pathList = append(pathList, newPath)
-			}
+	alreadyInAlbum := false
+	for _, id := range f.albumIDs {
+		if media.CollectionID == id {
+			alreadyInAlbum = true
+			break
+		}
+	}
 
-			if len(pathList) > 0 {
-				if caption != "" {
-					caption += " "
-				}
-				var quotedPaths []string
-				for _, p := range pathList {
-					quotedPaths = append(quotedPaths, fmt.Sprintf(`"%s"`, p))
-				}
-				caption += fmt.Sprintf("{paths:[%s]}", strings.Join(quotedPaths, ","))
-			}
-
-			if caption != media.Caption {
-				err := f.api.SetCaption(ctx, media.DedupKey, caption)
-				if err != nil {
-					fs.Debugf(f, "Failed to set description path for %q: %v", remote, err)
-				} else {
-					media.Caption = caption
-					_ = f.cache.UpsertItems([]api.MediaItem{media})
-				}
+	if !alreadyInAlbum && len(f.albumIDs) > 0 && mediaKey != "" {
+		targetAlbum, err := f.getTargetAlbumID()
+		if err == nil && targetAlbum != "" {
+			if err := f.api.AddMediaToAlbum(ctx, targetAlbum, []string{mediaKey}); err != nil {
+				fs.Errorf(f, "Failed to add %q to album %q: %v", remote, targetAlbum, err)
+			} else {
+				media.CollectionID = targetAlbum
+				_ = f.cache.UpsertItems([]api.MediaItem{media})
 			}
 		}
 	}
 
-	return &Object{
-		fs:       f,
-		remote:   remote,
-		media:    media,
-		hasMedia: true,
-	}, nil
+	return f.NewObject(ctx, remote)
+}
+
+func (f *Fs) putChunkedBinary(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, size int64) (fs.Object, error) {
+	chunkSize := int64(f.opt.BinaryDataChunkSize)
+	totalChunks := int((size + chunkSize - 1) / chunkSize)
+
+	baseName := path.Base(remote)
+	fullPath := path.Join(f.root, remote)
+	dir := path.Dir(fullPath)
+	if dir == "." || dir == "/" {
+		dir = ""
+	}
+	newPath := "/"
+	if dir != "" {
+		newPath = fmt.Sprintf("/%s", dir)
+	}
+
+	// Build upfront deterministic album assignment plan for all chunks
+	chunkAlbumPlan := make([]string, totalChunks)
+	alreadyInAlbum := make([]bool, totalChunks)
+
+	if len(f.albumIDs) > 0 {
+		albumCounts := make(map[string]int)
+		for _, id := range f.albumIDs {
+			count, err := f.cache.CountItemsInAlbum(id)
+			if err != nil {
+				return nil, fmt.Errorf("failed to check item count for album %s: %w", id, err)
+			}
+			albumCounts[id] = count
+		}
+
+		// Step 1: Detect existing chunks already assigned to an album from previous runs
+		for i := 0; i < totalChunks; i++ {
+			chunkFileName := f.opt.Enc.ToStandardName(fmt.Sprintf("%s.part%03d.mkv", baseName, i))
+			if ch, err := f.cache.GetByFileName(chunkFileName); err == nil && ch.CollectionID != "" {
+				for _, id := range f.albumIDs {
+					if ch.CollectionID == id {
+						chunkAlbumPlan[i] = id
+						alreadyInAlbum[i] = true
+						break
+					}
+				}
+			}
+		}
+
+		// Step 2: Assign unassigned chunks sequentially, filling each album to max_items_per_album
+		currentAlbumIdx := 0
+		for i := 0; i < totalChunks; i++ {
+			if chunkAlbumPlan[i] != "" {
+				continue // Already has an assigned album
+			}
+			for currentAlbumIdx < len(f.albumIDs) && albumCounts[f.albumIDs[currentAlbumIdx]] >= f.opt.MaxItemsPerAlbum {
+				currentAlbumIdx++
+			}
+			if currentAlbumIdx >= len(f.albumIDs) {
+				var statuses []string
+				for _, id := range f.albumIDs {
+					statuses = append(statuses, fmt.Sprintf("%s (%d/%d full)", id, albumCounts[id], f.opt.MaxItemsPerAlbum))
+				}
+				return nil, fmt.Errorf("insufficient album capacity: cannot assign chunk %d of %d (all %d configured albums have reached the %d items limit: [%s]). Please add more album IDs to album_ids or increase max_items_per_album",
+					i, totalChunks, len(f.albumIDs), f.opt.MaxItemsPerAlbum, strings.Join(statuses, ", "))
+			}
+			targetID := f.albumIDs[currentAlbumIdx]
+			chunkAlbumPlan[i] = targetID
+			albumCounts[targetID]++
+		}
+	}
+
+	totalSHA1, err := src.Hash(ctx, hash.SHA1)
+	if err != nil {
+		totalSHA1 = ""
+	}
+
+	concurrency := f.opt.BinaryDataChunkConcurrency
+	if concurrency < 1 {
+		concurrency = 4
+	}
+	if concurrency > totalChunks {
+		concurrency = totalChunks
+	}
+
+	totalStartTime := time.Now()
+	fs.Debugf(f, "[CHUNK-PIPELINE] Starting upload of %q (size: %d bytes, %d chunks @ %d bytes, concurrency: %d)",
+		remote, size, totalChunks, chunkSize, concurrency)
+
+	unwrappedIn, wrap := accounting.UnWrap(in)
+
+	type chunkUploadJob struct {
+		chunkIndex     int
+		encoded        *binary.EncodedMedia
+		token          string
+		mediaKey       string
+		targetAlbum    string
+		alreadyInAlbum bool
+	}
+
+	type chunkCommitJob struct {
+		chunkIndex     int
+		uploadResp     []byte
+		uploadFileName string
+		sha1Bytes      []byte
+		localDedupKey  string
+		cMediaSize     int64
+		mediaKey       string
+		details        binary.BinaryDetails
+		targetAlbum    string
+		alreadyInAlbum bool
+	}
+
+	// Buffer twice the concurrency so workers are never starved waiting for local encoding
+	queueCap := concurrency * 2
+	if queueCap > totalChunks {
+		queueCap = totalChunks
+	}
+	jobs := make(chan chunkUploadJob, queueCap)
+	commitJobs := make(chan chunkCommitJob, queueCap)
+	var uploadErr error
+	var errMu sync.Mutex
+	var wg sync.WaitGroup
+	var commitWg sync.WaitGroup
+
+	// Background producer goroutine: continuously pre-encodes chunks and pre-fetches tokens
+	go func() {
+		defer close(jobs)
+		for i := 0; i < totalChunks; i++ {
+			errMu.Lock()
+			hasErr := (uploadErr != nil)
+			errMu.Unlock()
+			if hasErr || ctx.Err() != nil {
+				fs.Debugf(f, "[PRODUCER] Aborting encoding loop due to error or cancellation")
+				break
+			}
+
+			thisChunkBytes := chunkSize
+			if i == totalChunks-1 {
+				thisChunkBytes = size - int64(i)*chunkSize
+			}
+
+			tEncode := time.Now()
+			fs.Debugf(f, "[PRODUCER] [Chunk %d/%d] Slicing & encoding %d bytes...", i, totalChunks, thisChunkBytes)
+
+			codecOpts := binary.CodecOptions{
+				MinVideoSize:    int64(f.opt.MinSizeNeededForBinaryVideo),
+				VideoResolution: f.opt.BinaryVideoResolution,
+			}
+			encodedChunk, err := binary.EncodeChunk(
+				io.LimitReader(unwrappedIn, thisChunkBytes),
+				baseName,
+				i,
+				totalChunks,
+				thisChunkBytes,
+				int64(i)*chunkSize,
+				size,
+				totalSHA1,
+				codecOpts,
+			)
+			if err != nil {
+				errMu.Lock()
+				if uploadErr == nil {
+					uploadErr = fmt.Errorf("chunk %d encoding failed: %w", i, err)
+				}
+				errMu.Unlock()
+				fs.Errorf(f, "[PRODUCER] [Chunk %d/%d] Encoding failed: %v", i, totalChunks, err)
+				break
+			}
+
+			cMediaSize := encodedChunk.MediaSize
+			sha1B64 := encodedChunk.MediaSHA1B64
+			sha1Bytes, _ := base64.StdEncoding.DecodeString(sha1B64)
+
+			// Pre-fetch upload token so workers start network transfers with 0ms latency
+			tPreFetch := time.Now()
+			mediaKey, _ := f.api.FindRemoteMediaByHash(ctx, sha1Bytes)
+			var token string
+			if mediaKey == "" {
+				token, err = f.api.GetUploadToken(ctx, sha1B64, cMediaSize)
+				if err != nil {
+					errMu.Lock()
+					if uploadErr == nil {
+						uploadErr = fmt.Errorf("chunk %d token pre-fetch failed: %w", i, err)
+					}
+					errMu.Unlock()
+					_ = encodedChunk.Close()
+					fs.Errorf(f, "[PRODUCER] [Chunk %d/%d] Token pre-fetch failed: %v", i, totalChunks, err)
+					break
+				}
+				fs.Debugf(f, "[PRODUCER] [Chunk %d/%d] Encoded in %v, pre-fetched token in %v. Queuing...",
+					i, totalChunks, time.Since(tEncode), time.Since(tPreFetch))
+			} else {
+				fs.Debugf(f, "[PRODUCER] [Chunk %d/%d] Encoded in %v (chunk already on remote). Queuing...",
+					i, totalChunks, time.Since(tEncode))
+			}
+
+			select {
+			case jobs <- chunkUploadJob{
+				chunkIndex:     i,
+				encoded:        encodedChunk,
+				token:          token,
+				mediaKey:       mediaKey,
+				targetAlbum:    chunkAlbumPlan[i],
+				alreadyInAlbum: alreadyInAlbum[i],
+			}:
+				fs.Debugf(f, "[PRODUCER] [Chunk %d/%d] Enqueued successfully with pre-fetched token (target: %s)",
+					i, totalChunks, chunkAlbumPlan[i])
+			case <-ctx.Done():
+				_ = encodedChunk.Close()
+				return
+			}
+		}
+	}()
+
+	// Background commit workers: process metadata commitments and captions asynchronously
+	const commitWorkers = 2
+	for c := 0; c < commitWorkers; c++ {
+		commitWg.Add(1)
+		cWorkerID := c
+		go func() {
+			defer commitWg.Done()
+			for cJob := range commitJobs {
+				errMu.Lock()
+				hasErr := (uploadErr != nil)
+				errMu.Unlock()
+				if hasErr || ctx.Err() != nil {
+					continue
+				}
+
+				mediaKey := cJob.mediaKey
+				if mediaKey == "" {
+					tCommit := time.Now()
+					var err error
+					mediaKey, err = f.api.CommitUpload(ctx, cJob.uploadResp, cJob.uploadFileName, cJob.sha1Bytes)
+					if err != nil {
+						errMu.Lock()
+						if uploadErr == nil {
+							uploadErr = fmt.Errorf("chunk %d commit failed: %w", cJob.chunkIndex, err)
+						}
+						errMu.Unlock()
+						fs.Errorf(f, "[COMMITTER-%d] [Chunk %d/%d] Commit failed: %v", cWorkerID, cJob.chunkIndex, totalChunks, err)
+						continue
+					}
+					fs.Debugf(f, "[COMMITTER-%d] [Chunk %d/%d] Commit finished in %v (mediaKey: %s)",
+						cWorkerID, cJob.chunkIndex, totalChunks, time.Since(tCommit), mediaKey)
+				}
+
+				if cJob.targetAlbum != "" && mediaKey != "" && !cJob.alreadyInAlbum {
+					if err := f.api.AddMediaToAlbum(ctx, cJob.targetAlbum, []string{mediaKey}); err != nil {
+						fs.Errorf(f, "[COMMITTER-%d] [Chunk %d/%d] Failed to add to album %q: %v",
+							cWorkerID, cJob.chunkIndex, totalChunks, cJob.targetAlbum, err)
+					}
+				}
+
+				media := api.MediaItem{
+					MediaKey:     mediaKey,
+					FileName:     cJob.uploadFileName,
+					SizeBytes:    cJob.cMediaSize,
+					DedupKey:     cJob.localDedupKey,
+					CollectionID: cJob.targetAlbum,
+				}
+
+				tCaption := time.Now()
+				chunkCaption := buildCaption([]string{newPath}, &cJob.details)
+				_ = f.api.SetCaption(ctx, media.DedupKey, chunkCaption)
+				media.Caption = chunkCaption
+				_ = f.cache.UpsertItems([]api.MediaItem{media})
+
+				fs.Debugf(f, "[COMMITTER-%d] [Chunk %d/%d] Caption set & cached in %v (album: %s)",
+					cWorkerID, cJob.chunkIndex, totalChunks, time.Since(tCaption), cJob.targetAlbum)
+			}
+		}()
+	}
+
+	// Upload worker pool: streams chunks continuously with 0ms inter-chunk delay and phase-shifted startup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		workerID := w
+		go func() {
+			defer wg.Done()
+
+			// Phase-shift worker startup (1.2s per worker) to stagger completion times across the pipeline
+			if workerID > 0 {
+				staggerDur := time.Duration(workerID) * 1200 * time.Millisecond
+				fs.Debugf(f, "[WORKER-%d] Starting with pipeline phase-shift delay of %v", workerID, staggerDur)
+				select {
+				case <-time.After(staggerDur):
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			for job := range jobs {
+				errMu.Lock()
+				hasErr := (uploadErr != nil)
+				errMu.Unlock()
+				if hasErr || ctx.Err() != nil {
+					_ = job.encoded.Close()
+					continue
+				}
+
+				tJobStart := time.Now()
+				fs.Debugf(f, "[WORKER-%d] [Chunk %d/%d] Dequeued ready-to-upload job (%s, %d bytes)",
+					workerID, job.chunkIndex, totalChunks, job.encoded.MediaFilename, job.encoded.MediaSize)
+
+				chunkUploadIn := wrap(job.encoded.File)
+				cMediaSize := job.encoded.MediaSize
+				sha1B64 := job.encoded.MediaSHA1B64
+				sha1Bytes, _ := base64.StdEncoding.DecodeString(sha1B64)
+				uploadFileName := f.opt.Enc.ToStandardName(job.encoded.MediaFilename)
+
+				s := strings.ReplaceAll(sha1B64, "+", "-")
+				s = strings.ReplaceAll(s, "/", "_")
+				localDedupKey := strings.TrimRight(s, "=")
+
+				if job.mediaKey != "" {
+					fs.Debugf(f, "[WORKER-%d] [Chunk %d/%d] Reusing existing chunk mediaKey %s (skipping upload)",
+						workerID, job.chunkIndex, totalChunks, job.mediaKey)
+					_, _ = io.Copy(io.Discard, chunkUploadIn)
+					_ = job.encoded.Close()
+
+					commitJobs <- chunkCommitJob{
+						chunkIndex:     job.chunkIndex,
+						uploadFileName: uploadFileName,
+						localDedupKey:  localDedupKey,
+						cMediaSize:     cMediaSize,
+						mediaKey:       job.mediaKey,
+						details:        job.encoded.Details,
+						targetAlbum:    job.targetAlbum,
+						alreadyInAlbum: job.alreadyInAlbum,
+					}
+					continue
+				}
+
+				// The upload token was already pre-fetched! Start network transfer immediately with 0ms delay!
+				tUpload := time.Now()
+				fs.Debugf(f, "[WORKER-%d] [Chunk %d/%d] Starting network transfer of %d bytes with pre-fetched token...",
+					workerID, job.chunkIndex, totalChunks, cMediaSize)
+
+				resp, err := f.api.UploadFile(ctx, chunkUploadIn, cMediaSize, job.token)
+				if err != nil {
+					_ = job.encoded.Close()
+					errMu.Lock()
+					if uploadErr == nil {
+						uploadErr = fmt.Errorf("chunk %d upload failed: %w", job.chunkIndex, err)
+					}
+					errMu.Unlock()
+					fs.Errorf(f, "[WORKER-%d] [Chunk %d/%d] UploadFile failed: %v", workerID, job.chunkIndex, totalChunks, err)
+					continue
+				}
+
+				uploadDuration := time.Since(tUpload)
+				uploadMBps := float64(cMediaSize) / (1024 * 1024) / uploadDuration.Seconds()
+				fs.Debugf(f, "[WORKER-%d] [Chunk %d/%d] Network transfer finished in %v (%.2f MB/s). Handing off to committer!",
+					workerID, job.chunkIndex, totalChunks, uploadDuration, uploadMBps)
+
+				_ = job.encoded.Close()
+
+				// Asynchronously hand off commit & caption to background queue without stalling the upload worker!
+				commitJobs <- chunkCommitJob{
+					chunkIndex:     job.chunkIndex,
+					uploadResp:     resp,
+					uploadFileName: uploadFileName,
+					sha1Bytes:      sha1Bytes,
+					localDedupKey:  localDedupKey,
+					cMediaSize:     cMediaSize,
+					details:        job.encoded.Details,
+					targetAlbum:    job.targetAlbum,
+					alreadyInAlbum: job.alreadyInAlbum,
+				}
+
+				fs.Debugf(f, "[WORKER-%d] [Chunk %d/%d] Immediately ready for next chunk (transfer time: %v)",
+					workerID, job.chunkIndex, totalChunks, time.Since(tJobStart))
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(commitJobs)
+	commitWg.Wait()
+
+	if uploadErr != nil {
+		return nil, uploadErr
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	fs.Debugf(f, "[CHUNK-PIPELINE] All %d chunks completed in %v. Finalizing cache...",
+		totalChunks, time.Since(totalStartTime))
+
+	f.cacheMu.Lock()
+	f.forceSync = true
+	f.cacheMu.Unlock()
+	_ = f.ensureCachePopulated(ctx)
+
+	return f.NewObject(ctx, remote)
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
@@ -1129,6 +1777,9 @@ func (o *Object) Size() int64 {
 	if !o.hasMedia {
 		return -1
 	}
+	if o.binDetails != nil {
+		return o.binDetails.Size
+	}
 	return o.media.SizeBytes
 }
 
@@ -1155,6 +1806,9 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	if !o.hasMedia {
 		return "", nil
 	}
+	if o.binDetails != nil && o.binDetails.SHA1 != "" {
+		return o.binDetails.SHA1, nil
+	}
 	return o.media.SHA1Hash, nil
 }
 
@@ -1163,40 +1817,54 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, errors.New("no media key available")
 	}
 
+	if o.binDetails != nil && o.binDetails.ChunkDetails != nil {
+		chunks, err := o.fs.cache.GetChunksByBinaryName(o.binDetails.Name)
+		if err == nil && len(chunks) > 0 {
+			return newChunkedStreamReader(ctx, o.fs, chunks, o.binDetails, options)
+		}
+	}
+
+	var stream io.ReadCloser
+
 	if o.fs.dlCache == nil {
 		downloadURL, err := o.fs.api.GetDownloadURL(ctx, o.media.MediaKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get download URL: %w", err)
 		}
-		body, err := o.fs.api.DownloadFile(ctx, downloadURL)
+		body, err := o.fs.api.DownloadFile(ctx, downloadURL, options...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download file: %w", err)
 		}
-		return body, nil
-	}
-
-	entry, err := o.fs.dlCache.getOrStart(ctx, o.media.MediaKey, o.media.SizeBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start download: %w", err)
-	}
-
-	reader := &cachedReader{
-		entry: entry,
-		dc:    o.fs.dlCache,
-	}
-
-	for _, option := range options {
-		switch opt := option.(type) {
-		case *fs.RangeOption:
-			if opt.Start >= 0 {
-				reader.readPos = opt.Start
-			}
-		case *fs.SeekOption:
-			reader.readPos = opt.Offset
+		stream = body
+	} else {
+		entry, err := o.fs.dlCache.getOrStart(ctx, o.media.MediaKey, o.media.SizeBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start download: %w", err)
 		}
+
+		reader := &cachedReader{
+			entry: entry,
+			dc:    o.fs.dlCache,
+		}
+
+		for _, option := range options {
+			switch opt := option.(type) {
+			case *fs.RangeOption:
+				if opt.Start >= 0 {
+					reader.readPos = opt.Start
+				}
+			case *fs.SeekOption:
+				reader.readPos = opt.Offset
+			}
+		}
+		stream = reader
 	}
 
-	return reader, nil
+	if o.binDetails != nil {
+		return binary.DecodeStream(stream, o.media.FileName, o.binDetails.Size)
+	}
+
+	return stream, nil
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
@@ -1321,55 +1989,10 @@ func (o *Object) Remove(ctx context.Context) error {
 	}
 
 	isDescMode := strings.ToLower(o.fs.opt.ListMode) == "description_path" || strings.ToLower(o.fs.opt.ListMode) == "description"
+	existingPaths, binDetails := parseCaption(o.media.Caption)
 	var pathList []string
-	var caption string
 
-	if isDescMode {
-		caption = o.media.Caption
-		pathsStr := ""
-		idx := strings.Index(caption, "{paths:[")
-		if idx != -1 {
-			endIdx := strings.Index(caption[idx:], "]}")
-			if endIdx != -1 {
-				pathsStr = caption[idx+len("{paths:[") : idx+endIdx]
-				caption = caption[:idx] + caption[idx+endIdx+2:]
-			}
-		} else {
-			idx = strings.Index(caption, "[paths:")
-			if idx != -1 {
-				endIdx := strings.Index(caption[idx:], "]")
-				if endIdx != -1 {
-					pathsStr = caption[idx+len("[paths:") : idx+endIdx]
-					caption = caption[:idx] + caption[idx+endIdx+1:]
-				}
-			} else {
-				idx = strings.Index(caption, "[path:")
-				if idx != -1 {
-					endIdx := strings.Index(caption[idx:], "]")
-					if endIdx != -1 {
-						pathsStr = caption[idx+len("[path:") : idx+endIdx]
-						caption = caption[:idx] + caption[idx+endIdx+1:]
-					}
-				}
-			}
-		}
-
-		caption = strings.TrimSpace(caption)
-
-		if pathsStr != "" {
-			parts := strings.Split(pathsStr, ",")
-			for _, p := range parts {
-				p = strings.TrimSpace(p)
-				p = strings.TrimPrefix(p, "\"")
-				p = strings.TrimSuffix(p, "\"")
-				p = strings.TrimSpace(p)
-				if p != "" {
-					pathList = append(pathList, p)
-				}
-			}
-		}
-
-		// Find the path we are trying to remove
+	if isDescMode && len(existingPaths) > 0 {
 		currentDir := path.Dir(o.remote)
 		if currentDir == "." || currentDir == "/" {
 			currentDir = ""
@@ -1380,42 +2003,66 @@ func (o *Object) Remove(ctx context.Context) error {
 			targetPath = fmt.Sprintf("/%s", currentDir)
 		}
 
-		// Remove the specific path from the array
-		var newPathList []string
-		for _, p := range pathList {
+		for _, p := range existingPaths {
 			if p != targetPath {
-				newPathList = append(newPathList, p)
+				pathList = append(pathList, p)
 			}
 		}
-		pathList = newPathList
 	}
 
 	// If not description mode, or if it was description mode but no paths remain
 	if !isDescMode || len(pathList) == 0 {
-		err := o.fs.api.MoveToTrash(ctx, []string{o.media.DedupKey})
+		var dedupKeys []string
+		var mediaKeys []string
+
+		if binDetails != nil && binDetails.ChunkDetails != nil {
+			// Atomically trash all chunks belonging to this file
+			if chunks, err := o.fs.cache.GetChunksByBinaryName(binDetails.Name); err == nil && len(chunks) > 0 {
+				for _, ch := range chunks {
+					if ch.DedupKey != "" {
+						dedupKeys = append(dedupKeys, ch.DedupKey)
+					}
+					mediaKeys = append(mediaKeys, ch.MediaKey)
+				}
+			}
+		}
+
+		if len(dedupKeys) == 0 {
+			dedupKeys = []string{o.media.DedupKey}
+			mediaKeys = []string{o.media.MediaKey}
+		}
+
+		err := o.fs.api.MoveToTrash(ctx, dedupKeys)
 		if err != nil {
 			return err
 		}
+		_ = o.fs.cache.DeleteItems(mediaKeys)
 	} else {
 		// Just update the caption because it still exists in other folders
-		if len(pathList) > 0 {
-			if caption != "" {
-				caption += " "
+		if binDetails != nil && binDetails.ChunkDetails != nil {
+			// Update caption across ALL chunks belonging to this file
+			if chunks, err := o.fs.cache.GetChunksByBinaryName(binDetails.Name); err == nil && len(chunks) > 0 {
+				for _, ch := range chunks {
+					_, chBin := parseCaption(ch.Caption)
+					newChCaption := buildCaption(pathList, chBin)
+					if newChCaption != ch.Caption && ch.DedupKey != "" {
+						_ = o.fs.api.SetCaption(ctx, ch.DedupKey, newChCaption)
+						ch.Caption = newChCaption
+						_ = o.fs.cache.UpsertItems([]api.MediaItem{ch})
+					}
+				}
 			}
-			var quotedPaths []string
-			for _, p := range pathList {
-				quotedPaths = append(quotedPaths, fmt.Sprintf(`"%s"`, p))
-			}
-			caption += fmt.Sprintf("{paths:[%s]}", strings.Join(quotedPaths, ","))
-		}
+		} else {
+			newCaption := buildCaption(pathList, binDetails)
 
-		if caption != o.media.Caption {
-			err := o.fs.api.SetCaption(ctx, o.media.DedupKey, caption)
-			if err != nil {
-				return fmt.Errorf("failed to update description path on remove: %w", err)
+			if newCaption != o.media.Caption {
+				err := o.fs.api.SetCaption(ctx, o.media.DedupKey, newCaption)
+				if err != nil {
+					return fmt.Errorf("failed to update description path on remove: %w", err)
+				}
+				o.media.Caption = newCaption
+				_ = o.fs.cache.UpsertItems([]api.MediaItem{o.media})
 			}
-			o.media.Caption = caption
-			_ = o.fs.cache.UpsertItems([]api.MediaItem{o.media})
 		}
 	}
 
