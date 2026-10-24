@@ -434,6 +434,11 @@ To clear the description:
 			Default:  20000,
 			Advanced: true,
 		}, {
+			Name:     "upload_timestamp",
+			Help:     "Override the photo/video taken time (capture timestamp) sent to Google Photos for uploaded items.\n\nSetting this to an old date pushes uploaded backup files and chunks to the very bottom of your Google Photos timeline so they do not clutter your recent photos.\n\nOptions:\n  \"\" or \"current\"  - Use current time (default)\n  \"oldest\"         - Use 1906-01-01 00:00:00 UTC (oldest date supported by Google Photos)\n  \"epoch\"          - Use Unix epoch: 1970-01-01 00:00:00 UTC\n  \"file\"           - Use the source file's modification time\n  \"YYYY-MM-DD\"     - Custom date (e.g. '1906-01-01' or '2000-01-01')\n  Unix timestamp   - Integer seconds since epoch (e.g. '-2019686400')\n\nOldest date allowed on Google Photos is 1906-01-01 (-2019686400). This only changes the timeline position on the Google Photos portal; the actual uploaded file bytes, EXIF data, and SHA-1 checksum remain 100% original and unmodified.",
+			Default:  "",
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -465,23 +470,25 @@ type Options struct {
 	AlbumIDs                    string               `config:"album_ids"`
 	AlbumID                     string               `config:"album_id"` // Backward compatibility alias
 	MaxItemsPerAlbum            int                  `config:"max_items_per_album"`
+	UploadTimestamp             string               `config:"upload_timestamp"`
 	Enc                         encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote Google Photos storage via mobile API
 type Fs struct {
-	name      string          // name of this remote
-	root      string          // the path we are working on
-	opt       Options         // parsed options
-	features  *fs.Features    // optional features
-	api       *MobileAPI      // mobile API client (includes pacer for rate limiting/retry)
-	cache     *Cache          // SQLite cache
-	albumIDs  []string        // parsed scoped album IDs
-	cacheMu   sync.Mutex      // protects cache operations
-	startTime time.Time       // time Fs was started
-	dlCache   *downloadCache  // shared download cache for temp files
-	dlExit    atexit.FnHandle // removes download cache temp files at exit
-	forceSync bool            // force next sync regardless of throttle
+	name                  string          // name of this remote
+	root                  string          // the path we are working on
+	opt                   Options         // parsed options
+	features              *fs.Features    // optional features
+	api                   *MobileAPI      // mobile API client (includes pacer for rate limiting/retry)
+	cache                 *Cache          // SQLite cache
+	albumIDs              []string        // parsed scoped album IDs
+	parsedUploadTimestamp int64           // parsed upload timestamp (-1 = now, -2 = file modtime, >= 0 = fixed)
+	cacheMu               sync.Mutex      // protects cache operations
+	startTime             time.Time       // time Fs was started
+	dlCache               *downloadCache  // shared download cache for temp files
+	dlExit                atexit.FnHandle // removes download cache temp files at exit
+	forceSync             bool            // force next sync regardless of throttle
 }
 
 type Object struct {
@@ -503,6 +510,78 @@ func (f *Fs) String() string {
 }
 
 func (f *Fs) Features() *fs.Features { return f.features }
+
+// Special timestamp sentinels and limits
+const (
+	UnsetTimestamp      = int64(-1 << 62) // Sentinel to use current time (now)
+	FileModTimestamp    = int64(-1 << 61) // Sentinel to use source file modification time
+	MinAllowedTimestamp = -2019686400     // 1906-01-01 00:00:00 UTC (oldest date supported by Google Photos)
+)
+
+// parseUploadTimestamp parses an upload_timestamp config string into seconds.
+// Returns:
+//   UnsetTimestamp: use current time (now)
+//   FileModTimestamp: use source file's modification time
+//   fixed unix timestamp (>= MinAllowedTimestamp)
+func parseUploadTimestamp(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	lower := strings.ToLower(s)
+	if lower == "" || lower == "current" || lower == "now" {
+		return UnsetTimestamp, nil
+	}
+	if lower == "oldest" {
+		return MinAllowedTimestamp, nil
+	}
+	if lower == "epoch" {
+		return 0, nil
+	}
+	if lower == "file" || lower == "modtime" {
+		return FileModTimestamp, nil
+	}
+
+	// Try integer unix timestamp
+	if unixSec, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if unixSec < MinAllowedTimestamp {
+			return 0, fmt.Errorf("timestamp %d cannot be earlier than 1906-01-01 (%d): oldest date allowed on Google Photos is 1906-01-01", unixSec, MinAllowedTimestamp)
+		}
+		return unixSec, nil
+	}
+
+	// Try common date formats
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, fmtStr := range formats {
+		if t, err := time.Parse(fmtStr, s); err == nil {
+			if t.Unix() < MinAllowedTimestamp {
+				return 0, fmt.Errorf("date %q cannot be earlier than 1906-01-01: oldest date allowed on Google Photos is 1906-01-01", s)
+			}
+			return t.Unix(), nil
+		}
+	}
+
+	return 0, fmt.Errorf("invalid upload_timestamp %q: must be 'oldest', 'epoch', 'file', 'current', a unix timestamp integer, or a date (e.g. '1906-01-01')", s)
+}
+
+func (f *Fs) getUploadTimestamp(ctx context.Context, src fs.ObjectInfo) int64 {
+	if f.parsedUploadTimestamp == FileModTimestamp {
+		if src != nil {
+			t := src.ModTime(ctx)
+			if !t.IsZero() && t.Unix() >= MinAllowedTimestamp {
+				return t.Unix()
+			}
+		}
+		return time.Now().Unix()
+	}
+	if f.parsedUploadTimestamp != UnsetTimestamp {
+		return f.parsedUploadTimestamp
+	}
+	return time.Now().Unix()
+}
 
 // NewFs constructs an Fs from the path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
@@ -556,6 +635,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 
+	parsedTS, err := parseUploadTimestamp(opt.UploadTimestamp)
+	if err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+
 	authData := opt.AuthData
 	if authData == "" {
 		return nil, errors.New("auth_data is required - set it via config or GP_AUTH_DATA env var")
@@ -606,13 +690,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	f := &Fs{
-		name:      name,
-		root:      root,
-		opt:       *opt,
-		api:       api,
-		cache:     cache,
-		albumIDs:  parsedAlbumIDs,
-		startTime: time.Now(),
+		name:                  name,
+		root:                  root,
+		opt:                   *opt,
+		api:                   api,
+		cache:                 cache,
+		albumIDs:              parsedAlbumIDs,
+		parsedUploadTimestamp: parsedTS,
+		startTime:             time.Now(),
 	}
 	if opt.DownloadCache {
 		f.dlCache = newDownloadCache(api)
@@ -972,7 +1057,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		}
 
 		uploadFileName = f.opt.Enc.ToStandardName(uploadFileName)
-		mediaKey, err = f.api.CommitUpload(ctx, uploadResp, uploadFileName, sha1Bytes)
+		commitTs := f.getUploadTimestamp(ctx, src)
+		mediaKey, err = f.api.CommitUpload(ctx, uploadResp, uploadFileName, sha1Bytes, commitTs)
 		if err != nil {
 			return nil, fmt.Errorf("commit upload failed: %w", err)
 		}
@@ -1311,7 +1397,8 @@ func (f *Fs) putChunkedBinary(ctx context.Context, in io.Reader, src fs.ObjectIn
 				if mediaKey == "" {
 					tCommit := time.Now()
 					var err error
-					mediaKey, err = f.api.CommitUpload(ctx, cJob.uploadResp, cJob.uploadFileName, cJob.sha1Bytes)
+					commitTs := f.getUploadTimestamp(ctx, src)
+					mediaKey, err = f.api.CommitUpload(ctx, cJob.uploadResp, cJob.uploadFileName, cJob.sha1Bytes, commitTs)
 					if err != nil {
 						errMu.Lock()
 						if uploadErr == nil {

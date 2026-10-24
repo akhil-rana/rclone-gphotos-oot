@@ -533,8 +533,12 @@ func (a *MobileAPI) UploadFile(ctx context.Context, body io.Reader, size int64, 
 // as the first field of the commit request (they contain an opaque upload
 // token that Google uses to associate the committed item with the uploaded bytes).
 // The response contains the new item's media_key at field path 1.3.1.
-func (a *MobileAPI) CommitUpload(ctx context.Context, uploadResponse []byte, fileName string, sha1Hash []byte) (string, error) {
-	body := buildCommitUploadRequest(uploadResponse, fileName, sha1Hash, a.model, a.deviceMake, a.androidAPI)
+func (a *MobileAPI) CommitUpload(ctx context.Context, uploadResponse []byte, fileName string, sha1Hash []byte, timestamp ...int64) (string, error) {
+	ts := UnsetTimestamp
+	if len(timestamp) > 0 {
+		ts = timestamp[0]
+	}
+	body := buildCommitUploadRequest(uploadResponse, fileName, sha1Hash, a.model, a.deviceMake, a.androidAPI, ts)
 
 	respBytes, err := a.doProtoRequest(ctx,
 		"https://photosdata-pa.googleapis.com/6439526531001121323/16538846908252377752",

@@ -203,6 +203,66 @@ func TestConfigValidation(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "requires at least") {
 		t.Fatalf("expected error for 4K with 64M chunk size, got: %v", err)
 	}
+
+	// Test 10: upload_timestamp pre-1906 date is rejected
+	m = configmap.Simple{
+		"auth_data":        "fake_auth",
+		"upload_timestamp": "1905-12-31",
+	}
+	_, err = gphotosmobile.NewFs(context.Background(), "test", "", m)
+	if err == nil || !strings.Contains(err.Error(), "cannot be earlier than 1906-01-01") {
+		t.Fatalf("expected error for pre-1906 date, got: %v", err)
+	}
+
+	// Test 11: upload_timestamp integer earlier than 1906 is rejected
+	m = configmap.Simple{
+		"auth_data":        "fake_auth",
+		"upload_timestamp": "-2019686401",
+	}
+	_, err = gphotosmobile.NewFs(context.Background(), "test", "", m)
+	if err == nil || !strings.Contains(err.Error(), "cannot be earlier than 1906-01-01") {
+		t.Fatalf("expected error for timestamp before 1906, got: %v", err)
+	}
+
+	// Test 12: upload_timestamp invalid string is rejected
+	m = configmap.Simple{
+		"auth_data":        "fake_auth",
+		"upload_timestamp": "not-a-valid-date",
+	}
+	_, err = gphotosmobile.NewFs(context.Background(), "test", "", m)
+	if err == nil || !strings.Contains(err.Error(), "invalid upload_timestamp") {
+		t.Fatalf("expected error for invalid date string, got: %v", err)
+	}
+
+	// Test 13: upload_timestamp='oldest' is valid (1906-01-01 00:00:00 UTC)
+	m = configmap.Simple{
+		"auth_data":        "fake_auth",
+		"upload_timestamp": "oldest",
+	}
+	_, err = gphotosmobile.NewFs(context.Background(), "test", "", m)
+	if err != nil {
+		t.Fatalf("expected 'oldest' to succeed, got: %v", err)
+	}
+
+	// Test 14: upload_timestamp='1906-01-01' is valid
+	m = configmap.Simple{
+		"auth_data":        "fake_auth",
+		"upload_timestamp": "1906-01-01",
+	}
+	_, err = gphotosmobile.NewFs(context.Background(), "test", "", m)
+	if err != nil {
+		t.Fatalf("expected '1906-01-01' to succeed, got: %v", err)
+	}
+
+	// Test 15: upload_timestamp='epoch' is valid (1970-01-01 00:00:00 UTC)
+	m = configmap.Simple{
+		"auth_data":        "fake_auth",
+		"upload_timestamp": "epoch",
+	}
+	_, err = gphotosmobile.NewFs(context.Background(), "test", "", m)
+	if err != nil {
+		t.Fatalf("expected 'epoch' to succeed, got: %v", err)
+	}
 }
 
 func TestAlbumFilter(t *testing.T) {

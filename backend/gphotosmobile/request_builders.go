@@ -857,9 +857,9 @@ func buildHashCheckRequest(sha1Hash []byte) []byte {
 //	    4: deviceMake         // e.g. "Google"
 //	    5: androidAPIVersion  // e.g. 28
 //	  }
-//	  3: [1, 3]              // constant bytes
-//	}
-func buildCommitUploadRequest(uploadResponse []byte, fileName string, sha1Hash []byte, model, deviceMake string, androidAPI int64) []byte {
+//        3: [1, 3]              // constant bytes
+//      }
+func buildCommitUploadRequest(uploadResponse []byte, fileName string, sha1Hash []byte, model, deviceMake string, androidAPI int64, timestamp int64) []byte {
 	outer := NewProtoBuilder()
 
 	f1 := NewProtoBuilder()
@@ -874,8 +874,11 @@ func buildCommitUploadRequest(uploadResponse []byte, fileName string, sha1Hash [
 	f1.AddBytes(3, sha1Hash)
 
 	// field 1.4 = timestamp info
+	if timestamp == UnsetTimestamp {
+		timestamp = time.Now().Unix()
+	}
 	f1_4 := NewProtoBuilder()
-	f1_4.AddVarint(1, uint64(time.Now().Unix()))
+	f1_4.AddVarint(1, uint64(timestamp))
 	f1_4.AddVarint(2, 46000000)
 	f1.AddMessage(4, f1_4)
 

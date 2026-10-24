@@ -154,6 +154,19 @@ To solve this, you can enable **Binary Data Chunking**:
 - **Virtual HTTP Range Seeking:** When an application (like `mpv`, VLC, or `rclone cat --offset`) sends an HTTP `Range` request for offset `X`, Rclone calculates the exact chunk index (`X / chunkSize`) and downloads **only that specific chunk**, achieving instant seeking without fetching preceding gigabytes of data.
 - **Transparent Composite Listing:** All chunks are displayed in `rclone ls` as a single, unified file with full original size and SHA-1 hash.
 
+### Timestamp Override (`upload_timestamp`)
+
+By default, Google Photos indexes newly uploaded items with the current date and time, placing them at the very top of your photos timeline. When storing large backups or chunked binary files, this can clutter your personal photo stream.
+
+You can override the capture timestamp using the advanced option `upload_timestamp`:
+- **`upload_timestamp = "oldest"` (or `"1906-01-01"`):** Sets the capture timestamp to **January 1, 1906 00:00:00 UTC** (Unix timestamp `-2019686400`), which is the **oldest allowable date supported by Google Photos**. This sends uploaded files and chunks over 120 years in the past to the ultimate bottom of your Google Photos timeline, ensuring your recent feed stays pristine!
+- **`upload_timestamp = "epoch"` (or `"1970-01-01"`):** Sets the capture timestamp to **January 1, 1970 00:00:00 UTC** (Unix timestamp `0`).
+- **`upload_timestamp = "file"`:** Automatically uses the source file's local modification time.
+- **`upload_timestamp = "YYYY-MM-DD"` (or Unix timestamp integer):** Sets a specific custom date (e.g. `'2000-01-01'` or `'0'`). Dates earlier than 1906-01-01 are automatically rejected.
+
+> [!NOTE]
+> **Zero File Modification:** This setting *only* controls the timeline sorting index on the Google Photos portal via the commit request. The actual uploaded file bytes, internal EXIF metadata, video container streams, and restored SHA-1 checksums remain 100% original, bit-for-bit identical, and untouched.
+
 ### Scoped Album Mode (`album_ids`)
 
 Google Photos enforces a hard limit of **20,000 items per album**. You can configure a remote scoped to one or more albums with automatic capacity tracking and spillover:
