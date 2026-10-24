@@ -10,7 +10,9 @@ An out-of-tree Rclone plugin for Google Photos that uses Google's internal Mobil
 ## Overview
 
 ### What is this?
+
 Google's official public API for Google Photos is heavily crippled:
+
 - **Restricted Access:** An application can only access files that were uploaded by that specific application itself (`photoslibrary.readonly.appcreateddata`). It cannot access your pre-existing Google Photos library or photos uploaded from your mobile phone.
 - **Forced Compression & Resolution Caps:** Media uploaded or downloaded through the public API is compressed or resolution-capped (16MP for photos, 1080p for videos), stripping original quality and metadata.
 - **Strict Quotas:** The public API enforces restrictive rate limits and daily quotas.
@@ -47,7 +49,9 @@ An upstream pull request was proposed in [rclone/rclone#9135](https://github.com
 Choose one of the following methods to obtain the Rclone executable with the out-of-tree Google Photos backend:
 
 #### Option A: Download Pre-compiled Binary (Recommended)
+
 Download the latest pre-compiled release for your operating system and architecture from the **[Releases](https://github.com/akhil-rana/rclone-gphotos-oot/releases)** page:
+
 - **Linux:** `.tar.gz` binary archive, `.deb` package, or `.rpm` package.
 - **macOS:** `.zip` archive (`osx`).
 - **Windows:** `.zip` archive (`windows`).
@@ -55,15 +59,27 @@ Download the latest pre-compiled release for your operating system and architect
 Extract the executable (or install the package) and proceed directly to **Step 2**.
 
 #### Option B: Build from Source
-If you have Go installed and prefer to build the binary yourself, clone the repository and run:
+
+If you have Go installed and prefer to build the binary yourself, clone the repository and run the command for your operating system. Go builds for the current OS by default:
+
+**Windows (PowerShell):**
+
+```powershell
+go build -o rclone.exe rclone.go
+```
+
+**macOS or Linux:**
 
 ```bash
 go build -o rclone rclone.go
 ```
 
+From the project folder, launch the Windows executable with `.\rclone.exe`; on macOS or Linux use `./rclone`. If you install the executable or add its folder to `PATH`, use `rclone` instead. For a step-by-step Windows setup, PATH installation, and Web GUI walkthrough, see [WINDOWS_SETUP.md](WINDOWS_SETUP.md).
+
 ---
 
 ### 2. Configure a New Remote
+
 Launch Rclone's interactive configuration menu:
 
 ```bash
@@ -106,7 +122,8 @@ Google Photos does not support true folders natively. In `description_path` mode
 {paths:["/pictures/vacation", "/favorites"]}
 ```
 
-#### How it works:
+#### How it works
+
 - **Uploads & Copies:** When you copy a file into a folder (e.g., `rclone copy photo.jpg gphotos:pictures/vacation`), Rclone automatically appends `{paths:["/pictures/vacation"]}` to the caption.
 - **Multiple Virtual Folders (Hardlinks):** If you copy the same file into a second folder (`gphotos:pictures/favorites`), Rclone avoids re-uploading the bytes; instead, it appends the new path to the JSON array: `{paths:["/pictures/vacation", "/pictures/favorites"]}`. The file instantly appears in both folders!
 - **Safe Unlinking on Delete:** When deleting a file from one virtual folder, Rclone only strips that folder from the caption. The actual image is only moved to the Google Photos Trash when its last remaining virtual path is removed.
@@ -122,15 +139,18 @@ Google Photos does not support true folders natively. In `description_path` mode
 > <summary><b>Harmless Notice: <code>internal error: no overview data found</code></b> (Click to expand)</summary>
 >
 > You will notice the following message printed when running commands:
+>
 > ```text
 > ERROR : internal error: no overview data found for "gphotosmobile"
 > ```
+>
 > **This message is completely cosmetic and safe to ignore.**
 >
 > Upstream Rclone's internal registry expects embedded overview documentation metadata that is only generated during official in-tree Rclone builds. Because this backend operates as an independent out-of-tree plugin, this notice is emitted by Rclone's core registry and cannot be suppressed without modifying upstream Rclone. It has zero impact on functionality, reliability, or file transfers.
 > </details>
 
 ### List Files
+
 ```bash
 # List all files according to your configured list_mode
 rclone ls gphotos:
@@ -140,6 +160,7 @@ rclone lsd gphotos:
 ```
 
 ### Upload / Backup Files
+
 ```bash
 # Upload a local directory
 rclone copy /home/user/Pictures gphotos:pictures --progress
@@ -149,6 +170,7 @@ rclone sync /home/user/Pictures gphotos:pictures --progress
 ```
 
 ### Download Files in Original Quality
+
 ```bash
 # Download a folder preserving full, bit-for-bit original quality
 rclone copy gphotos:pictures /home/user/RestoredPhotos --progress
