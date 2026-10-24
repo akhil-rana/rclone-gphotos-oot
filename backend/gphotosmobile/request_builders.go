@@ -857,9 +857,9 @@ func buildHashCheckRequest(sha1Hash []byte) []byte {
 //	    4: deviceMake         // e.g. "Google"
 //	    5: androidAPIVersion  // e.g. 28
 //	  }
-//	  3: [1, 3]              // constant bytes
-//	}
-func buildCommitUploadRequest(uploadResponse []byte, fileName string, sha1Hash []byte, model, deviceMake string, androidAPI int64) []byte {
+//        3: [1, 3]              // constant bytes
+//      }
+func buildCommitUploadRequest(uploadResponse []byte, fileName string, sha1Hash []byte, model, deviceMake string, androidAPI int64, timestamp int64) []byte {
 	outer := NewProtoBuilder()
 
 	f1 := NewProtoBuilder()
@@ -874,8 +874,11 @@ func buildCommitUploadRequest(uploadResponse []byte, fileName string, sha1Hash [
 	f1.AddBytes(3, sha1Hash)
 
 	// field 1.4 = timestamp info
+	if timestamp == UnsetTimestamp {
+		timestamp = time.Now().Unix()
+	}
 	f1_4 := NewProtoBuilder()
-	f1_4.AddVarint(1, uint64(time.Now().Unix()))
+	f1_4.AddVarint(1, uint64(timestamp))
 	f1_4.AddVarint(2, 46000000)
 	f1.AddMessage(4, f1_4)
 
@@ -903,17 +906,13 @@ func buildCommitUploadRequest(uploadResponse []byte, fileName string, sha1Hash [
 	return outer.Bytes()
 }
 
-// buildMoveToTrashRequest builds the move to trash request.
-// Items are identified by dedup_key (URL-safe base64 SHA1), not media_key.
-// The request also includes a field mask (field 8) telling the server which
-// response fields to return, and client info (field 9) with the APK version.
-func buildMoveToTrashRequest(dedupKeys []string, apkVersion, androidAPI int64) []byte {
+func buildTrashActionRequest(dedupKeys []string, action uint64, apkVersion, androidAPI int64) []byte {
 	b := NewProtoBuilder()
 	b.AddVarint(2, 1)
 	for _, key := range dedupKeys {
 		b.AddString(3, key)
 	}
-	b.AddVarint(4, 1)
+	b.AddVarint(4, action)
 
 	f8 := NewProtoBuilder()
 	f8_4 := NewProtoBuilder()
@@ -937,6 +936,16 @@ func buildMoveToTrashRequest(dedupKeys []string, apkVersion, androidAPI int64) [
 	b.AddMessage(9, f9)
 
 	return b.Bytes()
+}
+
+// buildMoveToTrashRequest builds the move to trash request (action = 1).
+func buildMoveToTrashRequest(dedupKeys []string, apkVersion, androidAPI int64) []byte {
+	return buildTrashActionRequest(dedupKeys, 1, apkVersion, androidAPI)
+}
+
+// buildRestoreFromTrashRequest builds the restore from trash request (action = 2).
+func buildRestoreFromTrashRequest(dedupKeys []string, apkVersion, androidAPI int64) []byte {
+	return buildTrashActionRequest(dedupKeys, 2, apkVersion, androidAPI)
 }
 
 // buildGetDownloadURLsRequest builds the request to obtain a time-limited
@@ -987,5 +996,35 @@ func buildSetCaptionRequest(dedupKey, caption string) []byte {
 	b := NewProtoBuilder()
 	b.AddString(2, caption)
 	b.AddString(3, dedupKey)
+	return b.Bytes()
+}
+
+// buildAddMediaToAlbumRequest builds the AddMediaToAlbum request body
+//
+//	Request {
+//	  1: repeated string media_keys
+//	  2: string album_media_key
+//	  5: { 1: 2 }
+//	  6: device_info { 3: model, 4: make, 5: android_api_version }
+//	  7: timestamp
+//	}
+func buildAddMediaToAlbumRequest(albumMediaKey string, mediaKeys []string, model, make string, androidAPI int64) []byte {
+	b := NewProtoBuilder()
+	for _, k := range mediaKeys {
+		b.AddString(1, k)
+	}
+	b.AddString(2, albumMediaKey)
+
+	f5 := NewProtoBuilder()
+	f5.AddVarint(1, 2)
+	b.AddMessage(5, f5)
+
+	f6 := NewProtoBuilder()
+	f6.AddString(3, model)
+	f6.AddString(4, make)
+	f6.AddVarint(5, uint64(androidAPI))
+	b.AddMessage(6, f6)
+
+	b.AddVarint(7, uint64(time.Now().Unix()))
 	return b.Bytes()
 }
