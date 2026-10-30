@@ -520,9 +520,10 @@ const (
 
 // parseUploadTimestamp parses an upload_timestamp config string into seconds.
 // Returns:
-//   UnsetTimestamp: use current time (now)
-//   FileModTimestamp: use source file's modification time
-//   fixed unix timestamp (>= MinAllowedTimestamp)
+//
+//	UnsetTimestamp: use current time (now)
+//	FileModTimestamp: use source file's modification time
+//	fixed unix timestamp (>= MinAllowedTimestamp)
 func parseUploadTimestamp(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	lower := strings.ToLower(s)
@@ -779,6 +780,15 @@ func (f *Fs) getVirtualPaths(item *api.MediaItem, fileName string) []string {
 	return relPaths
 }
 
+func (f *Fs) captionPathForRemote(remote string) string {
+	fullPath := path.Join(f.root, remote)
+	dir := path.Dir(fullPath)
+	if dir == "." || dir == "/" {
+		return "/"
+	}
+	return fmt.Sprintf("/%s", dir)
+}
+
 // NewObject finds the Object at remote
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if err := f.ensureCachePopulated(ctx); err != nil {
@@ -787,11 +797,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	_, fileName := path.Split(remote)
 	fileName = f.opt.Enc.ToStandardName(fileName)
+	captionPath := f.captionPathForRemote(remote)
 
 	item, err := f.cache.GetByFileName(fileName)
 	if errors.Is(err, sql.ErrNoRows) {
 		if f.opt.SupportBinaryData {
-			item, err = f.cache.GetByBinaryName(fileName)
+			item, err = f.cache.GetByBinaryName(fileName, captionPath)
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			item, err = f.findByDedupSuffix(fileName)
@@ -823,7 +834,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if f.opt.SupportBinaryData {
 		_, binDetails = parseCaption(item.Caption)
 		if binDetails != nil && binDetails.ChunkDetails != nil {
-			chunks, err := f.cache.GetChunksByBinaryName(binDetails.Name)
+			chunks, err := f.cache.GetChunksByBinaryName(binDetails.Name, captionPath)
 			if err != nil || len(chunks) < binDetails.ChunkDetails.TotalChunks {
 				// Incomplete chunked file!
 				return nil, fs.ErrorObjectNotFound
@@ -1088,6 +1099,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		media.MediaKey = mediaKey
 	}
 
+	isDescMode := strings.ToLower(f.opt.ListMode) == "description_path" || strings.ToLower(f.opt.ListMode) == "description"
 	if media.DedupKey != "" {
 		if media.TrashTimestamp > 0 {
 			// The item was previously moved to trash. Restore it on Google Photos!
@@ -1112,37 +1124,39 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 			}
 		}
 
-		fullPath := path.Join(f.root, remote)
-		dir := path.Dir(fullPath)
-		if dir == "." || dir == "/" {
-			dir = ""
-		}
-
-		newPath := "/"
-		if dir != "" {
-			newPath = fmt.Sprintf("/%s", dir)
-		}
-
-		pathList := existingPaths
-		exists := false
-		for _, p := range pathList {
-			if p == newPath {
-				exists = true
-				break
+		var (
+			newCaption          string
+			shouldUpdateCaption bool
+		)
+		if isDescMode {
+			newPath := f.captionPathForRemote(remote)
+			pathList := existingPaths
+			exists := false
+			for _, p := range pathList {
+				if p == newPath {
+					exists = true
+					break
+				}
 			}
-		}
-		if !exists {
-			pathList = append(pathList, newPath)
+			if !exists {
+				pathList = append(pathList, newPath)
+			}
+			newCaption = buildCaption(pathList, binDetails)
+			shouldUpdateCaption = true
+		} else if binDetails != nil && existingBin == nil {
+			newCaption = buildCaption(existingPaths, binDetails)
+			shouldUpdateCaption = true
 		}
 
-		newCaption := buildCaption(pathList, binDetails)
-		err := f.api.SetCaption(ctx, media.DedupKey, newCaption)
-		if err != nil {
-			fs.Debugf(f, "Failed to set caption for %q: %v", remote, err)
-		} else {
-			media.Caption = newCaption
-			media.TrashTimestamp = 0
-			_ = f.cache.UpsertItems([]api.MediaItem{media})
+		if shouldUpdateCaption {
+			err := f.api.SetCaption(ctx, media.DedupKey, newCaption)
+			if err != nil {
+				fs.Debugf(f, "Failed to set caption for %q: %v", remote, err)
+			} else {
+				media.Caption = newCaption
+				media.TrashTimestamp = 0
+				_ = f.cache.UpsertItems([]api.MediaItem{media})
+			}
 		}
 	}
 
@@ -1200,14 +1214,22 @@ func (f *Fs) putChunkedBinary(ctx context.Context, in io.Reader, src fs.ObjectIn
 
 		// Step 1: Detect existing chunks already assigned to an album from previous runs
 		for i := 0; i < totalChunks; i++ {
-			chunkFileName := f.opt.Enc.ToStandardName(fmt.Sprintf("%s.part%03d.mkv", baseName, i))
-			if ch, err := f.cache.GetByFileName(chunkFileName); err == nil && ch.CollectionID != "" {
-				for _, id := range f.albumIDs {
-					if ch.CollectionID == id {
-						chunkAlbumPlan[i] = id
-						alreadyInAlbum[i] = true
-						break
+			chunkFileNames := []string{
+				f.opt.Enc.ToStandardName(fmt.Sprintf("%s.part%03d.mkv", baseName, i)),
+				f.opt.Enc.ToStandardName(fmt.Sprintf("%s.part%03d.png", baseName, i)),
+			}
+			for _, chunkFileName := range chunkFileNames {
+				if ch, err := f.cache.GetByFileName(chunkFileName); err == nil && ch.CollectionID != "" {
+					for _, id := range f.albumIDs {
+						if ch.CollectionID == id {
+							chunkAlbumPlan[i] = id
+							alreadyInAlbum[i] = true
+							break
+						}
 					}
+				}
+				if chunkAlbumPlan[i] != "" {
+					break
 				}
 			}
 		}
@@ -1237,7 +1259,10 @@ func (f *Fs) putChunkedBinary(ctx context.Context, in io.Reader, src fs.ObjectIn
 
 	totalSHA1, err := src.Hash(ctx, hash.SHA1)
 	if err != nil {
-		totalSHA1 = ""
+		return nil, fmt.Errorf("failed to read source SHA1 for chunked upload: %w", err)
+	}
+	if totalSHA1 == "" {
+		return nil, errors.New("failed to read source SHA1 for chunked upload: empty hash")
 	}
 
 	concurrency := f.opt.BinaryDataChunkConcurrency
@@ -1412,11 +1437,21 @@ func (f *Fs) putChunkedBinary(ctx context.Context, in io.Reader, src fs.ObjectIn
 						cWorkerID, cJob.chunkIndex, totalChunks, time.Since(tCommit), mediaKey)
 				}
 
+				collectionID := ""
 				if cJob.targetAlbum != "" && mediaKey != "" && !cJob.alreadyInAlbum {
 					if err := f.api.AddMediaToAlbum(ctx, cJob.targetAlbum, []string{mediaKey}); err != nil {
+						errMu.Lock()
+						if uploadErr == nil {
+							uploadErr = fmt.Errorf("chunk %d failed to add media to album %q: %w", cJob.chunkIndex, cJob.targetAlbum, err)
+						}
+						errMu.Unlock()
 						fs.Errorf(f, "[COMMITTER-%d] [Chunk %d/%d] Failed to add to album %q: %v",
 							cWorkerID, cJob.chunkIndex, totalChunks, cJob.targetAlbum, err)
+						continue
 					}
+					collectionID = cJob.targetAlbum
+				} else if cJob.alreadyInAlbum {
+					collectionID = cJob.targetAlbum
 				}
 
 				media := api.MediaItem{
@@ -1424,14 +1459,30 @@ func (f *Fs) putChunkedBinary(ctx context.Context, in io.Reader, src fs.ObjectIn
 					FileName:     cJob.uploadFileName,
 					SizeBytes:    cJob.cMediaSize,
 					DedupKey:     cJob.localDedupKey,
-					CollectionID: cJob.targetAlbum,
+					CollectionID: collectionID,
 				}
 
 				tCaption := time.Now()
 				chunkCaption := buildCaption([]string{newPath}, &cJob.details)
-				_ = f.api.SetCaption(ctx, media.DedupKey, chunkCaption)
+				if err := f.api.SetCaption(ctx, media.DedupKey, chunkCaption); err != nil {
+					errMu.Lock()
+					if uploadErr == nil {
+						uploadErr = fmt.Errorf("chunk %d caption update failed: %w", cJob.chunkIndex, err)
+					}
+					errMu.Unlock()
+					fs.Errorf(f, "[COMMITTER-%d] [Chunk %d/%d] Failed to set caption: %v", cWorkerID, cJob.chunkIndex, totalChunks, err)
+					continue
+				}
 				media.Caption = chunkCaption
-				_ = f.cache.UpsertItems([]api.MediaItem{media})
+				if err := f.cache.UpsertItems([]api.MediaItem{media}); err != nil {
+					errMu.Lock()
+					if uploadErr == nil {
+						uploadErr = fmt.Errorf("chunk %d cache upsert failed: %w", cJob.chunkIndex, err)
+					}
+					errMu.Unlock()
+					fs.Errorf(f, "[COMMITTER-%d] [Chunk %d/%d] Failed to upsert cache: %v", cWorkerID, cJob.chunkIndex, totalChunks, err)
+					continue
+				}
 
 				fs.Debugf(f, "[COMMITTER-%d] [Chunk %d/%d] Caption set & cached in %v (album: %s)",
 					cWorkerID, cJob.chunkIndex, totalChunks, time.Since(tCaption), cJob.targetAlbum)
@@ -1905,7 +1956,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	if o.binDetails != nil && o.binDetails.ChunkDetails != nil {
-		chunks, err := o.fs.cache.GetChunksByBinaryName(o.binDetails.Name)
+		chunks, err := o.fs.cache.GetChunksByBinaryName(o.binDetails.Name, o.fs.captionPathForRemote(o.remote))
 		if err == nil && len(chunks) > 0 {
 			return newChunkedStreamReader(ctx, o.fs, chunks, o.binDetails, options)
 		}
@@ -1913,12 +1964,17 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	var stream io.ReadCloser
 
+	downloadOptions := options
+	if o.binDetails != nil {
+		downloadOptions = nil
+	}
+
 	if o.fs.dlCache == nil {
 		downloadURL, err := o.fs.api.GetDownloadURL(ctx, o.media.MediaKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get download URL: %w", err)
 		}
-		body, err := o.fs.api.DownloadFile(ctx, downloadURL, options...)
+		body, err := o.fs.api.DownloadFile(ctx, downloadURL, downloadOptions...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download file: %w", err)
 		}
@@ -1934,14 +1990,16 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			dc:    o.fs.dlCache,
 		}
 
-		for _, option := range options {
-			switch opt := option.(type) {
-			case *fs.RangeOption:
-				if opt.Start >= 0 {
-					reader.readPos = opt.Start
+		if o.binDetails == nil {
+			for _, option := range options {
+				switch opt := option.(type) {
+				case *fs.RangeOption:
+					if opt.Start >= 0 {
+						reader.readPos = opt.Start
+					}
+				case *fs.SeekOption:
+					reader.readPos = opt.Offset
 				}
-			case *fs.SeekOption:
-				reader.readPos = opt.Offset
 			}
 		}
 		stream = reader
@@ -1962,6 +2020,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	newO := newObj.(*Object)
 	o.media = newO.media
 	o.hasMedia = newO.hasMedia
+	o.binDetails = newO.binDetails
 	return nil
 }
 
@@ -2104,7 +2163,7 @@ func (o *Object) Remove(ctx context.Context) error {
 
 		if binDetails != nil && binDetails.ChunkDetails != nil {
 			// Atomically trash all chunks belonging to this file
-			if chunks, err := o.fs.cache.GetChunksByBinaryName(binDetails.Name); err == nil && len(chunks) > 0 {
+			if chunks, err := o.fs.cache.GetChunksByBinaryName(binDetails.Name, o.fs.captionPathForRemote(o.remote)); err == nil && len(chunks) > 0 {
 				for _, ch := range chunks {
 					if ch.DedupKey != "" {
 						dedupKeys = append(dedupKeys, ch.DedupKey)
@@ -2128,7 +2187,7 @@ func (o *Object) Remove(ctx context.Context) error {
 		// Just update the caption because it still exists in other folders
 		if binDetails != nil && binDetails.ChunkDetails != nil {
 			// Update caption across ALL chunks belonging to this file
-			if chunks, err := o.fs.cache.GetChunksByBinaryName(binDetails.Name); err == nil && len(chunks) > 0 {
+			if chunks, err := o.fs.cache.GetChunksByBinaryName(binDetails.Name, o.fs.captionPathForRemote(o.remote)); err == nil && len(chunks) > 0 {
 				for _, ch := range chunks {
 					_, chBin := parseCaption(ch.Caption)
 					newChCaption := buildCaption(pathList, chBin)

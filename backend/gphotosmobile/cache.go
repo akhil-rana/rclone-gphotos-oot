@@ -34,15 +34,33 @@ package gphotosmobile
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/user/rclone-gphotos-oot/backend/gphotosmobile/api"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/user/rclone-gphotos-oot/backend/gphotosmobile/api"
 	_ "modernc.org/sqlite" // sqlite driver registration
 )
+
+func escapeLikePattern(in string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(in)
+}
+
+func containsCaptionPath(paths []string, want string) bool {
+	if want == "" {
+		return true
+	}
+	for _, p := range paths {
+		if p == want {
+			return true
+		}
+	}
+	return false
+}
 
 // Cache wraps SQLite storage for the media library index
 type Cache struct {
@@ -382,8 +400,10 @@ func (c *Cache) GetByFileName(fileName string) (*api.MediaItem, error) {
 }
 
 // GetByBinaryName retrieves a media item whose caption metadata specifies the original binary filename
-func (c *Cache) GetByBinaryName(binaryName string) (*api.MediaItem, error) {
-	searchPattern := fmt.Sprintf(`%%"name":"%s"%%`, binaryName)
+// and contains the provided virtual caption path.
+func (c *Cache) GetByBinaryName(binaryName, captionPath string) (*api.MediaItem, error) {
+	escapedJSON, _ := json.Marshal(binaryName)
+	searchPattern := fmt.Sprintf(`%%"name":%s%%`, escapeLikePattern(string(escapedJSON)))
 	query := `SELECT
 		media_key, file_name, dedup_key, is_canonical, type, caption,
 		collection_id, size_bytes, quota_charged_bytes, origin,
@@ -394,20 +414,43 @@ func (c *Cache) GetByBinaryName(binaryName string) (*api.MediaItem, error) {
 		location_id, is_edited, make, model, aperture, shutter_speed,
 		iso, focal_length, duration, capture_frame_rate, encoded_frame_rate,
 		is_micro_video, micro_video_width, micro_video_height, sha1_hash
-	FROM remote_media WHERE (trash_timestamp = 0 OR trash_timestamp IS NULL) AND caption LIKE ?`
+	FROM remote_media WHERE (trash_timestamp = 0 OR trash_timestamp IS NULL) AND caption LIKE ? ESCAPE '\'`
 	args := []any{searchPattern}
 	clause, albumArgs := c.buildAlbumClause()
 	query += clause
 	args = append(args, albumArgs...)
-	query += ` ORDER BY file_name ASC LIMIT 1`
+	query += ` ORDER BY file_name ASC`
 
-	row := c.db.QueryRow(query, args...)
-	return scanMediaItem(row)
+	rows, err := c.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		item, err := scanMediaItemFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		paths, bin := parseCaption(item.Caption)
+		if bin == nil || bin.Name != binaryName {
+			continue
+		}
+		if !containsCaptionPath(paths, captionPath) {
+			continue
+		}
+		return item, nil
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return nil, sql.ErrNoRows
 }
 
 // GetChunksByBinaryName retrieves all chunk items belonging to a chunked binary file
-func (c *Cache) GetChunksByBinaryName(binaryName string) ([]api.MediaItem, error) {
-	searchPattern := fmt.Sprintf(`%%"name":"%s"%%`, binaryName)
+func (c *Cache) GetChunksByBinaryName(binaryName, captionPath string) ([]api.MediaItem, error) {
+	escapedJSON, _ := json.Marshal(binaryName)
+	searchPattern := fmt.Sprintf(`%%"name":%s%%`, escapeLikePattern(string(escapedJSON)))
 	query := `SELECT
 		media_key, file_name, dedup_key, is_canonical, type, caption,
 		collection_id, size_bytes, quota_charged_bytes, origin,
@@ -418,7 +461,7 @@ func (c *Cache) GetChunksByBinaryName(binaryName string) ([]api.MediaItem, error
 		location_id, is_edited, make, model, aperture, shutter_speed,
 		iso, focal_length, duration, capture_frame_rate, encoded_frame_rate,
 		is_micro_video, micro_video_width, micro_video_height, sha1_hash
-	FROM remote_media WHERE (trash_timestamp = 0 OR trash_timestamp IS NULL) AND caption LIKE ?`
+	FROM remote_media WHERE (trash_timestamp = 0 OR trash_timestamp IS NULL) AND caption LIKE ? ESCAPE '\'`
 	args := []any{searchPattern}
 	clause, albumArgs := c.buildAlbumClause()
 	query += clause
@@ -436,6 +479,13 @@ func (c *Cache) GetChunksByBinaryName(binaryName string) ([]api.MediaItem, error
 		item, err := scanMediaItemFromRows(rows)
 		if err != nil {
 			return nil, err
+		}
+		paths, bin := parseCaption(item.Caption)
+		if bin == nil || bin.Name != binaryName {
+			continue
+		}
+		if !containsCaptionPath(paths, captionPath) {
+			continue
 		}
 		items = append(items, *item)
 	}

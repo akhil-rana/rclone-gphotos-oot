@@ -25,17 +25,17 @@ var (
 	idMuxingApp      = []byte{0x4D, 0x80}
 	idWritingApp     = []byte{0x57, 0x41}
 
-	idTracks        = []byte{0x16, 0x54, 0xAE, 0x6B}
-	idTrackEntry    = []byte{0xAE}
-	idTrackNumber   = []byte{0xD7}
-	idTrackUID      = []byte{0x73, 0xC5}
-	idTrackType     = []byte{0x83}
-	idFlagLacing    = []byte{0x9C}
-	idCodecID       = []byte{0x86}
-	idCodecPrivate  = []byte{0x63, 0xA2}
-	idVideo         = []byte{0xE0}
-	idPixelWidth    = []byte{0xB0}
-	idPixelHeight   = []byte{0xBA}
+	idTracks       = []byte{0x16, 0x54, 0xAE, 0x6B}
+	idTrackEntry   = []byte{0xAE}
+	idTrackNumber  = []byte{0xD7}
+	idTrackUID     = []byte{0x73, 0xC5}
+	idTrackType    = []byte{0x83}
+	idFlagLacing   = []byte{0x9C}
+	idCodecID      = []byte{0x86}
+	idCodecPrivate = []byte{0x63, 0xA2}
+	idVideo        = []byte{0xE0}
+	idPixelWidth   = []byte{0xB0}
+	idPixelHeight  = []byte{0xBA}
 
 	idCluster     = []byte{0x1F, 0x43, 0xB6, 0x75}
 	idTimestamp   = []byte{0xE7}
@@ -112,6 +112,10 @@ func EncodeMKV(dst io.Writer, src io.Reader, fileSize int64, res VideoResolution
 	if totalFrames == 0 {
 		totalFrames = 1
 	}
+	const fps = 24
+	if totalFrames < fps {
+		totalFrames = fps
+	}
 
 	// 1. EBML Header
 	var ebmlHeader bytes.Buffer
@@ -137,7 +141,7 @@ func EncodeMKV(dst io.Writer, src io.Reader, fileSize int64, res VideoResolution
 
 	// 3. Info Element
 	var info bytes.Buffer
-	info.Write(makeUintElement(idTimestampScale, 1000000)) // 1ms
+	info.Write(makeUintElement(idTimestampScale, 1000)) // 1µs
 	info.Write(makeStringElement(idMuxingApp, "rclone-gphotosmobile"))
 	info.Write(makeStringElement(idWritingApp, "rclone-gphotosmobile"))
 	if _, err := dst.Write(makeElement(idInfo, info.Bytes())); err != nil {
@@ -165,22 +169,17 @@ func EncodeMKV(dst io.Writer, src io.Reader, fileSize int64, res VideoResolution
 	}
 
 	// 5. Clusters and SimpleBlocks
-	// Standard 24 fps (41.67 ms per frame). 24 frames per cluster (1 second).
-	const fps = 24
-	const frameDurationMs = 1000 / fps
+	// Standard 24 fps with one frame per cluster to keep memory bounded.
 	frameBuf := make([]byte, frameBytes)
 
 	for frameIdx := 0; frameIdx < totalFrames; {
 		clusterStartFrame := frameIdx
-		clusterTimestamp := uint64(clusterStartFrame * frameDurationMs)
+		clusterTimestamp := uint64(clusterStartFrame * 1_000_000 / fps) // in 1µs ticks
 
 		var clusterPayload bytes.Buffer
 		clusterPayload.Write(makeUintElement(idTimestamp, clusterTimestamp))
 
-		framesInThisCluster := totalFrames - clusterStartFrame
-		if framesInThisCluster > fps {
-			framesInThisCluster = fps
-		}
+		framesInThisCluster := 1
 
 		for i := 0; i < framesInThisCluster; i++ {
 			n, err := io.ReadFull(src, frameBuf)
@@ -196,7 +195,7 @@ func EncodeMKV(dst io.Writer, src io.Reader, fileSize int64, res VideoResolution
 			}
 
 			// SimpleBlock: Track 1 (0x81), Relative Time (int16), Flags (0x80 Keyframe), Payload
-			relTime := int16(i * frameDurationMs)
+			relTime := int16(0)
 			blockHeader := make([]byte, 4)
 			blockHeader[0] = 0x81 // Track 1
 			binary.BigEndian.PutUint16(blockHeader[1:3], uint16(relTime))

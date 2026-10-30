@@ -205,11 +205,40 @@ func EncodeChunk(src io.Reader, baseName string, chunkIndex, totalChunks int, th
 }
 
 // DecodeStream returns an io.ReadCloser that decodes a downloaded media stream into the original binary bytes.
-func DecodeStream(mediaStream io.Reader, filename string, originalSize int64) (io.ReadCloser, error) {
+func DecodeStream(mediaStream io.ReadCloser, filename string, originalSize int64) (io.ReadCloser, error) {
 	ext := strings.ToLower(filepath.Ext(filename))
+	var (
+		decoder io.ReadCloser
+		err     error
+	)
 	if ext == ".png" {
-		return NewPNGDecoder(mediaStream, originalSize)
+		decoder, err = NewPNGDecoder(mediaStream, originalSize)
+	} else {
+		// Default to MKV decoder
+		decoder, err = NewMKVDecoder(mediaStream, originalSize)
 	}
-	// Default to MKV decoder
-	return NewMKVDecoder(mediaStream, originalSize)
+	if err != nil {
+		_ = mediaStream.Close()
+		return nil, err
+	}
+	return &decodedStreamReader{decoder: decoder, src: mediaStream}, nil
+}
+
+type decodedStreamReader struct {
+	decoder io.ReadCloser
+	src     io.Closer
+}
+
+func (r *decodedStreamReader) Read(p []byte) (int, error) {
+	return r.decoder.Read(p)
+}
+
+func (r *decodedStreamReader) Close() error {
+	err := r.decoder.Close()
+	if r.src != nil {
+		if closeErr := r.src.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
